@@ -46,9 +46,9 @@ export function applyServerConfig(updateConfig: UpdateConfig, serverConfig: Serv
         endpoints,
     });
     const modelValue = (model: string) => (model ? `${SERVER_CHANNEL_ID}::${model}` : "");
-    const imageModels = uniqueModels(serverConfig.imageModels).map(modelValue).filter(Boolean);
-    const videoModels = uniqueModels(serverConfig.videoModels).map(modelValue).filter(Boolean);
-    const textModels = uniqueModels(serverConfig.textModels).map(modelValue).filter(Boolean);
+    const imageModels = uniqueModels([...(serverConfig.imageModels || []), ...(serverConfig.endpoints?.image?.models || [])]).map(modelValue).filter(Boolean);
+    const videoModels = uniqueModels([...(serverConfig.videoModels || []), ...(serverConfig.endpoints?.video?.models || [])]).map(modelValue).filter(Boolean);
+    const textModels = uniqueModels([...(serverConfig.textModels || []), ...(serverConfig.endpoints?.text?.models || [])]).map(modelValue).filter(Boolean);
     const audioModels = uniqueModels(serverConfig.audioModels).map(modelValue).filter(Boolean);
     const models = channelModels.map(modelValue).filter(Boolean);
 

@@ -521,10 +521,10 @@ export function AppConfigModal() {
 function withChannels(config: AiConfig, channels: ModelChannel[]): AiConfig {
     const normalizedChannels = channels.map(syncChannelModels);
     const models = modelOptionsFromChannels(normalizedChannels);
-    const imageModels = keepOrSuggest(config.imageModels, filterModelsByCapability(models, "image"), models);
-    const videoModels = keepOrSuggest(config.videoModels, filterModelsByCapability(models, "video"), models);
-    const textModels = keepOrSuggest(config.textModels, filterModelsByCapability(models, "text"), models);
-    const audioModels = keepOrSuggest(config.audioModels, filterModelsByCapability(models, "audio"), models);
+    const imageModels = mergeOrSuggest(config.imageModels, filterModelsByCapability(models, "image"), models);
+    const videoModels = mergeOrSuggest(config.videoModels, filterModelsByCapability(models, "video"), models);
+    const textModels = mergeOrSuggest(config.textModels, filterModelsByCapability(models, "text"), models);
+    const audioModels = mergeOrSuggest(config.audioModels, filterModelsByCapability(models, "audio"), models);
     const firstEndpoint = firstConfiguredEndpoint(normalizedChannels[0]) || normalizedChannels[0]?.endpoints.image;
     return {
         ...config,
@@ -619,10 +619,11 @@ function endpointLabel(key: ModelEndpointKey) {
     return endpointGroups.find((group) => group.key === key)?.label || key;
 }
 
-function keepOrSuggest(current: string[], suggested: string[], allModels: string[]) {
+function mergeOrSuggest(current: string[], suggested: string[], allModels: string[]) {
     const available = new Set(allModels);
     const kept = uniqueModels(current).filter((model) => available.has(model));
-    return kept.length ? kept : suggested;
+    const merged = uniqueModels([...kept, ...suggested]);
+    return merged.length ? merged : suggested;
 }
 
 function normalizeDefaultModel(value: string, options: string[]) {

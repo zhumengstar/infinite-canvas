@@ -73,11 +73,12 @@ export async function readResolvedServerAiConfig(): Promise<ResolvedServerAiConf
     const hasEndpointConfig = Boolean(persisted.endpoints);
     const legacyBaseUrl = firstValue(hasEndpointConfig ? undefined : persisted.baseUrl, process.env.CANVAS_AI_BASE_URL);
     const legacyApiKey = firstValue(hasEndpointConfig ? undefined : persisted.apiKey, process.env.CANVAS_AI_API_KEY);
-    const imageModels = withDefault(splitValues(persisted.imageModels?.length ? persisted.imageModels : persisted.endpoints?.image?.models, "CANVAS_IMAGE_MODELS", defaultImageModels), persisted.imageModel || process.env.CANVAS_DEFAULT_IMAGE_MODEL);
-    const videoModels = withDefault(splitValues(persisted.videoModels?.length ? persisted.videoModels : persisted.endpoints?.video?.models, "CANVAS_VIDEO_MODELS", defaultVideoModels), persisted.videoModel || process.env.CANVAS_DEFAULT_VIDEO_MODEL);
-    const textModels = withDefault(splitValues(persisted.textModels?.length ? persisted.textModels : persisted.endpoints?.text?.models, "CANVAS_TEXT_MODELS", defaultTextModels), persisted.textModel || process.env.CANVAS_DEFAULT_TEXT_MODEL);
+    const persistedModels = splitValues(persisted.models, "CANVAS_MODELS", []);
+    const imageModels = withDefault(splitValues(unique([...(persisted.imageModels || []), ...(persisted.endpoints?.image?.models || []), ...filterModels(persistedModels, "image")]), "CANVAS_IMAGE_MODELS", defaultImageModels), persisted.imageModel || process.env.CANVAS_DEFAULT_IMAGE_MODEL);
+    const videoModels = withDefault(splitValues(unique([...(persisted.videoModels || []), ...(persisted.endpoints?.video?.models || []), ...filterModels(persistedModels, "video")]), "CANVAS_VIDEO_MODELS", defaultVideoModels), persisted.videoModel || process.env.CANVAS_DEFAULT_VIDEO_MODEL);
+    const textModels = withDefault(splitValues(unique([...(persisted.textModels || []), ...(persisted.endpoints?.text?.models || []), ...filterModels(persistedModels, "text")]), "CANVAS_TEXT_MODELS", defaultTextModels), persisted.textModel || process.env.CANVAS_DEFAULT_TEXT_MODEL);
     const audioModels = withDefault(splitValues(persisted.audioModels, "CANVAS_AUDIO_MODELS", defaultAudioModels), persisted.audioModel || process.env.CANVAS_DEFAULT_AUDIO_MODEL);
-    const models = unique([...imageModels, ...videoModels, ...textModels, ...audioModels, ...splitValues(persisted.models, "CANVAS_MODELS", [])]);
+    const models = unique([...imageModels, ...videoModels, ...textModels, ...audioModels, ...persistedModels]);
     const endpoints: Record<ServerEndpointKey, ResolvedServerEndpointConfig> = {
         image: resolveEndpoint("image", persisted.endpoints?.image, legacyBaseUrl, legacyApiKey, imageModels),
         text: resolveEndpoint("text", persisted.endpoints?.text, legacyBaseUrl, legacyApiKey, textModels),
@@ -222,7 +223,7 @@ function resolveEndpoint(key: ServerEndpointKey, endpoint: PersistedServerEndpoi
         proxyBaseUrl: `/api/ai/${key}`,
         baseUrl: firstValue(endpoint?.baseUrl, legacyBaseUrl),
         apiKey: firstValue(endpoint?.apiKey, legacyApiKey),
-        models: unique(endpoint?.models?.length ? endpoint.models : models),
+        models: unique([...(endpoint?.models || []), ...models]),
     };
 }
 
