@@ -10,7 +10,7 @@ import { syncAppDataToWebdav, type AppSyncDomainKey, type AppSyncProgressEvent }
 import { testWebdavConnection, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webdav-sync";
 import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from "@/lib/audio-generation";
 import { applyServerConfig, SERVER_API_KEY_PLACEHOLDER, type ServerConfig } from "@/lib/server-config-client";
-import { createModelChannel, defaultBaseUrlForApiFormat, filterModelsByCapability, modelOptionLabel, modelOptionName, modelOptionsFromChannels, normalizeModelOptionValue, useConfigStore, type AiConfig, type ApiCallFormat, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import { createModelChannel, decodeChannelModel, defaultBaseUrlForApiFormat, filterModelsByCapability, modelOptionLabel, modelOptionName, modelOptionsFromChannels, normalizeModelOptionValue, useConfigStore, type AiConfig, type ApiCallFormat, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 
 type ModelGroup = {
     capability: ModelCapability;
@@ -116,6 +116,19 @@ export function AppConfigModal() {
 
     const updateChannel = (id: string, patch: Partial<ModelChannel>) => {
         updateChannels(config.channels.map((channel) => (channel.id === id ? { ...channel, ...patch, models: patch.models ? uniqueModels(patch.models) : channel.models } : channel)));
+    };
+
+    const updateChannelTextModels = (channel: ModelChannel, textModels: string[]) => {
+        const rawTextModels = uniqueModels(textModels.map(modelOptionName));
+        const channels = config.channels.map((item) => (item.id === channel.id ? { ...item, models: uniqueModels([...item.models, ...rawTextModels]) } : item));
+        const nextConfig = withChannels(config, channels);
+        const otherTextModels = config.textModels.filter((model) => !belongsToChannel(model, channel));
+        const nextTextModels = uniqueModels([...otherTextModels, ...rawTextModels.map((model) => normalizeModelOptionValue(model, channels)).filter(Boolean)]);
+        saveConfig({
+            ...nextConfig,
+            textModels: nextTextModels,
+            textModel: normalizeDefaultModel(config.textModel, nextTextModels) || nextTextModels[0] || "",
+        });
     };
 
     const updateChannelApiFormat = (channel: ModelChannel, apiFormat: ApiCallFormat) => {
@@ -309,6 +322,18 @@ export function AppConfigModal() {
                                                 <Form.Item label="模型列表" className="mb-0 md:col-span-2">
                                                     <Select mode="tags" showSearch allowClear maxTagCount="responsive" placeholder="输入模型名，或点击拉取模型" value={channel.models} onChange={(models) => updateChannel(channel.id, { models })} />
                                                 </Form.Item>
+                                                <Form.Item label="文本模型" extra="用于画布助手、提示词优化和文本生成；可直接输入模型名。" className="mb-0 md:col-span-2">
+                                                    <Select
+                                                        mode="tags"
+                                                        showSearch
+                                                        allowClear
+                                                        maxTagCount="responsive"
+                                                        placeholder="例如 gpt-4o-mini、gpt-5.5"
+                                                        value={channelTextModels(config, channel)}
+                                                        options={channel.models.map((model) => ({ label: model, value: model }))}
+                                                        onChange={(models) => updateChannelTextModels(channel, models)}
+                                                    />
+                                                </Form.Item>
                                             </div>
                                         </section>
                                     ))}
@@ -483,6 +508,16 @@ function isPersistableServerChannel(channel: ModelChannel) {
     const baseUrl = channel.baseUrl.trim();
     const apiKey = channel.apiKey.trim();
     return Boolean(baseUrl && apiKey && baseUrl !== "/api/ai" && apiKey !== SERVER_API_KEY_PLACEHOLDER);
+}
+
+function belongsToChannel(model: string, channel: ModelChannel) {
+    const decoded = decodeChannelModel(model);
+    if (decoded) return decoded.channelId === channel.id;
+    return channel.models.includes(modelOptionName(model));
+}
+
+function channelTextModels(config: AiConfig, channel: ModelChannel) {
+    return config.textModels.filter((model) => belongsToChannel(model, channel)).map(modelOptionName);
 }
 
 async function saveServerConfig(config: AiConfig, channel: ModelChannel): Promise<ServerConfig> {
