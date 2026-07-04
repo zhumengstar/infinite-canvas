@@ -5,10 +5,12 @@ import { useEffect, useRef } from "react";
 import { App } from "antd";
 
 import { createModelChannel, useConfigStore } from "@/stores/use-config-store";
+import { applyServerConfig, type ServerConfig } from "@/lib/server-config-client";
 
 export function ClientRootInit({ children }: { children: ReactNode }) {
     const { message } = App.useApp();
     const handledConfigParams = useRef(false);
+    const handledServerConfig = useRef(false);
     const updateConfig = useConfigStore((state) => state.updateConfig);
     const config = useConfigStore((state) => state.config);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
@@ -45,6 +47,22 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
         openConfigDialog(false);
         message.success("已导入本地直连配置");
     }, [config.channels, message, openConfigDialog, updateConfig]);
+
+    useEffect(() => {
+        if (handledServerConfig.current) return;
+        handledServerConfig.current = true;
+        const controller = new AbortController();
+        void fetch("/api/server-config", { cache: "no-store", signal: controller.signal })
+            .then((response) => (response.ok ? response.json() : null))
+            .then((serverConfig: ServerConfig | null) => {
+                if (!serverConfig?.enabled) return;
+                applyServerConfig(updateConfig, serverConfig);
+            })
+            .catch((error) => {
+                if (error instanceof DOMException && error.name === "AbortError") return;
+            });
+        return () => controller.abort();
+    }, [updateConfig]);
 
     return <>{children}</>;
 }

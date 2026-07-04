@@ -9,7 +9,8 @@ import { fetchChannelModels } from "@/services/api/image";
 import { syncAppDataToWebdav, type AppSyncDomainKey, type AppSyncProgressEvent } from "@/services/app-sync";
 import { testWebdavConnection, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webdav-sync";
 import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from "@/lib/audio-generation";
-import { createModelChannel, defaultBaseUrlForApiFormat, filterModelsByCapability, modelOptionLabel, modelOptionsFromChannels, normalizeModelOptionValue, useConfigStore, type AiConfig, type ApiCallFormat, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import { applyServerConfig, SERVER_API_KEY_PLACEHOLDER, type ServerConfig } from "@/lib/server-config-client";
+import { createModelChannel, defaultBaseUrlForApiFormat, filterModelsByCapability, modelOptionLabel, modelOptionName, modelOptionsFromChannels, normalizeModelOptionValue, useConfigStore, type AiConfig, type ApiCallFormat, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 
 type ModelGroup = {
     capability: ModelCapability;
@@ -61,6 +62,7 @@ export function AppConfigModal() {
     const { message } = App.useApp();
     const [activeTab, setActiveTab] = useState("channels");
     const [loadingChannelId, setLoadingChannelId] = useState("");
+    const [savingServerConfig, setSavingServerConfig] = useState(false);
     const [testingWebdav, setTestingWebdav] = useState(false);
     const [syncingWebdav, setSyncingWebdav] = useState(false);
     const [webdavSyncStatus, setWebdavSyncStatus] = useState("");
@@ -80,10 +82,29 @@ export function AppConfigModal() {
         (Object.keys(nextConfig) as Array<keyof AiConfig>).forEach((key) => updateConfig(key, nextConfig[key]));
     };
 
-    const finishConfig = () => {
-        const ready = config.channels.some((channel) => channel.baseUrl.trim() && channel.apiKey.trim() && channel.models.length);
+    const finishConfig = async () => {
+        const ready = config.channels.some((channel) => channel.baseUrl.trim() && channel.apiKey.trim());
+        if (!ready) {
+            setConfigDialogOpen(false);
+            return;
+        }
+        const serverChannel = config.channels.find(isPersistableServerChannel);
+        if (serverChannel) {
+            setSavingServerConfig(true);
+            try {
+                const serverConfig = await saveServerConfig(config, serverChannel);
+                applyServerConfig(updateConfig, serverConfig);
+                setConfigDialogOpen(false);
+                message.success(shouldPromptContinue ? "已保存到服务器，请继续刚才的请求" : "已保存到服务器");
+                clearPromptContinue();
+            } catch (error) {
+                message.error(error instanceof Error ? error.message : "保存服务器配置失败");
+            } finally {
+                setSavingServerConfig(false);
+            }
+            return;
+        }
         setConfigDialogOpen(false);
-        if (!ready) return;
         message.success(shouldPromptContinue ? "配置已保存，请继续刚才的请求" : "配置已保存");
         clearPromptContinue();
     };
@@ -221,8 +242,8 @@ export function AppConfigModal() {
             onCancel={() => setConfigDialogOpen(false)}
             styles={{ body: { maxHeight: "72vh", overflowY: "auto", paddingRight: 12 } }}
             footer={
-                <Button type="primary" onClick={finishConfig}>
-                    完成
+                <Button type="primary" loading={savingServerConfig} onClick={() => void finishConfig()}>
+                    保存
                 </Button>
             }
         >
@@ -240,7 +261,7 @@ export function AppConfigModal() {
                                         <div className="flex w-fit max-w-full flex-wrap items-center gap-1.5 rounded-md border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-xs text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-100">
                                             <CircleAlert className="size-3.5 shrink-0" />
                                             <span className="font-semibold">重要：</span>
-                                            <span>新增或拉取模型后，需要到“模型”Tab 选择可选项才会显示。</span>
+                                            <span>填写 URL 和 Key 后点保存，会自动存到服务器并启用服务器代理。</span>
                                             <Button type="link" size="small" className="h-auto p-0 text-xs font-semibold text-amber-900 dark:text-amber-100" onClick={() => setActiveTab("models")}>
                                                 去模型设置
                                             </Button>
@@ -456,6 +477,41 @@ function withChannels(config: AiConfig, channels: ModelChannel[]): AiConfig {
         textModel: normalizeDefaultModel(config.textModel, textModels),
         audioModel: normalizeDefaultModel(config.audioModel, audioModels),
     };
+}
+
+function isPersistableServerChannel(channel: ModelChannel) {
+    const baseUrl = channel.baseUrl.trim();
+    const apiKey = channel.apiKey.trim();
+    return Boolean(baseUrl && apiKey && baseUrl !== "/api/ai" && apiKey !== SERVER_API_KEY_PLACEHOLDER);
+}
+
+async function saveServerConfig(config: AiConfig, channel: ModelChannel): Promise<ServerConfig> {
+    const payload = {
+        enabled: true,
+        channelName: channel.name || "服务器渠道",
+        apiFormat: "openai",
+        baseUrl: channel.baseUrl,
+        apiKey: channel.apiKey,
+        models: channel.models.map(modelOptionName),
+        imageModels: config.imageModels.map(modelOptionName),
+        videoModels: config.videoModels.map(modelOptionName),
+        textModels: config.textModels.map(modelOptionName),
+        audioModels: config.audioModels.map(modelOptionName),
+        imageModel: modelOptionName(config.imageModel),
+        videoModel: modelOptionName(config.videoModel),
+        textModel: modelOptionName(config.textModel),
+        audioModel: modelOptionName(config.audioModel),
+    };
+    const response = await fetch("/api/server-config", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(data?.error || "保存服务器配置失败");
+    return data as ServerConfig;
 }
 
 function keepOrSuggest(current: string[], suggested: string[], allModels: string[]) {
