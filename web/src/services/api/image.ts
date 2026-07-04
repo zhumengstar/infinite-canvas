@@ -607,9 +607,99 @@ function parseGeminiImagePayload(payload: GeminiPayload) {
     return images;
 }
 
+type ServerImageJobPayload = {
+    action: "generation" | "edit";
+    model: string;
+    prompt: string;
+    count: number;
+    quality: string;
+    size: string;
+    references?: ReferenceImage[];
+    mask?: ReferenceImage;
+};
+type ServerImageJobResponse = {
+    id: string;
+    status: "queued" | "running" | "success" | "error";
+    error?: string;
+    result?: Array<{ id: string; dataUrl: string }>;
+};
+
+function isServerImageJobConfig(config: AiConfig) {
+    return config.apiKey === "server-side" && config.baseUrl.includes("/api/ai/image");
+}
+
+async function requestServerImageJob(payload: ServerImageJobPayload, options?: RequestOptions) {
+    const created = await fetchServerImageJob("/api/image-jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: options?.signal,
+    });
+    const started = await readServerImageJobResponse(created);
+    return pollServerImageJob(started.id, options);
+}
+
+async function pollServerImageJob(id: string, options?: RequestOptions) {
+    for (;;) {
+        await waitForServerImageJob(options?.signal);
+        const response = await fetchServerImageJob(`/api/image-jobs?id=${encodeURIComponent(id)}`, { signal: options?.signal });
+        const job = await readServerImageJobResponse(response);
+        if (job.status === "success") {
+            if (!job.result?.length) throw new Error("接口没有返回图片");
+            return job.result;
+        }
+        if (job.status === "error") throw new Error(job.error || "生成失败");
+    }
+}
+
+async function fetchServerImageJob(input: RequestInfo | URL, init?: RequestInit) {
+    try {
+        return await fetch(input, { ...init, cache: "no-store" });
+    } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") throw new Error("请求已取消");
+        throw error;
+    }
+}
+
+async function readServerImageJobResponse(response: Response): Promise<ServerImageJobResponse> {
+    const payload = (await response.json().catch(() => ({}))) as Partial<ServerImageJobResponse> & { error?: string };
+    if (!response.ok) throw new Error(payload.error || readStatusError(response.status, "请求失败"));
+    if (!payload.id) throw new Error("服务器任务响应无效");
+    return payload as ServerImageJobResponse;
+}
+
+function waitForServerImageJob(signal?: AbortSignal) {
+    if (signal?.aborted) return Promise.reject(new Error("请求已取消"));
+    return new Promise<void>((resolve, reject) => {
+        const timeout = window.setTimeout(done, 1500);
+        signal?.addEventListener("abort", abort, { once: true });
+        function done() {
+            signal?.removeEventListener("abort", abort);
+            resolve();
+        }
+        function abort() {
+            window.clearTimeout(timeout);
+            reject(new Error("请求已取消"));
+        }
+    });
+}
+
 export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
     const requestConfig = resolveModelRequestConfig(config, config.imageModel || config.model, "image");
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
+    if (isServerImageJobConfig(requestConfig)) {
+        return requestServerImageJob(
+            {
+                action: "generation",
+                model: requestConfig.model,
+                prompt: withSystemPrompt(requestConfig, prompt),
+                count: n,
+                quality: config.quality,
+                size: config.size,
+            },
+            options,
+        );
+    }
     if (requestConfig.apiFormat === "gemini") {
         try {
             return await requestGeminiImages(requestConfig, prompt, [], n, options);
@@ -647,6 +737,21 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     const requestConfig = resolveModelRequestConfig(config, config.imageModel || config.model, "image");
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const requestPrompt = buildImageReferencePromptText(prompt, references);
+    if (isServerImageJobConfig(requestConfig)) {
+        return requestServerImageJob(
+            {
+                action: "edit",
+                model: requestConfig.model,
+                prompt: withSystemPrompt(requestConfig, requestPrompt),
+                count: n,
+                quality: config.quality,
+                size: config.size,
+                references: await Promise.all(references.map(async (image) => ({ ...image, dataUrl: await imageToDataUrl(image) }))),
+                mask: mask ? { ...mask, dataUrl: await imageToDataUrl(mask) } : undefined,
+            },
+            options,
+        );
+    }
     if (requestConfig.apiFormat === "gemini") {
         if (mask) throw new Error("Gemini 调用格式暂不支持蒙版编辑");
         try {
