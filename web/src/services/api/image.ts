@@ -90,7 +90,7 @@ type GeminiPayload = {
     promptFeedback?: { blockReason?: string };
 };
 type GeminiStreamState = { buffer: string; text: string; toolCalls: ResponseToolCall[]; error?: string };
-type RequestOptions = { signal?: AbortSignal };
+export type RequestOptions = { signal?: AbortSignal; onServerJobStarted?: (jobId: string) => void };
 
 const QUALITY_BASE: Record<string, number> = {
     low: 1024,
@@ -636,10 +636,11 @@ async function requestServerImageJob(payload: ServerImageJobPayload, options?: R
         signal: options?.signal,
     });
     const started = await readServerImageJobResponse(created);
+    options?.onServerJobStarted?.(started.id);
     return pollServerImageJob(started.id, options);
 }
 
-async function pollServerImageJob(id: string, options?: RequestOptions) {
+export async function pollServerImageJob(id: string, options?: RequestOptions) {
     for (;;) {
         await waitForServerImageJob(options?.signal);
         const response = await fetchServerImageJob(`/api/image-jobs?id=${encodeURIComponent(id)}`, { signal: options?.signal });
