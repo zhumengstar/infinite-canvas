@@ -5,12 +5,12 @@ import { CircleAlert, Cloud, Plus, RefreshCw, Trash2, Wifi } from "lucide-react"
 import { useState } from "react";
 
 import { ModelPicker } from "@/components/model-picker";
-import { fetchChannelModels } from "@/services/api/image";
+import { fetchChannelEndpointModels } from "@/services/api/image";
 import { syncAppDataToWebdav, type AppSyncDomainKey, type AppSyncProgressEvent } from "@/services/app-sync";
 import { testWebdavConnection, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webdav-sync";
 import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from "@/lib/audio-generation";
 import { applyServerConfig, SERVER_API_KEY_PLACEHOLDER, type ServerConfig } from "@/lib/server-config-client";
-import { createModelChannel, decodeChannelModel, defaultBaseUrlForApiFormat, filterModelsByCapability, modelOptionLabel, modelOptionName, modelOptionsFromChannels, normalizeModelOptionValue, useConfigStore, type AiConfig, type ApiCallFormat, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import { channelModels, createModelChannel, createModelEndpoint, defaultBaseUrlForApiFormat, filterModelsByCapability, modelEndpointKeys, modelOptionLabel, modelOptionName, modelOptionsFromChannels, normalizeModelOptionValue, useConfigStore, type AiConfig, type ApiCallFormat, type ModelCapability, type ModelChannel, type ModelEndpointConfig, type ModelEndpointKey } from "@/stores/use-config-store";
 
 type ModelGroup = {
     capability: ModelCapability;
@@ -18,6 +18,13 @@ type ModelGroup = {
     modelsKey: "imageModels" | "videoModels" | "textModels" | "audioModels";
     defaultLabel: string;
     optionsLabel: string;
+};
+
+type EndpointGroup = {
+    key: ModelEndpointKey;
+    label: string;
+    hint: string;
+    placeholder: string;
 };
 
 type WebdavDomainProgress = {
@@ -33,6 +40,12 @@ const modelGroups: ModelGroup[] = [
     { capability: "video", modelKey: "videoModel", modelsKey: "videoModels", defaultLabel: "默认视频模型", optionsLabel: "视频模型可选项" },
     { capability: "text", modelKey: "textModel", modelsKey: "textModels", defaultLabel: "默认文本模型", optionsLabel: "文本模型可选项" },
     { capability: "audio", modelKey: "audioModel", modelsKey: "audioModels", defaultLabel: "默认音频模型", optionsLabel: "音频模型可选项" },
+];
+
+const endpointGroups: EndpointGroup[] = [
+    { key: "image", label: "图片", hint: "生图、图片编辑和画布标注编辑", placeholder: "例如 gpt-image-2、seedream" },
+    { key: "text", label: "文本", hint: "画布助手、提示词优化和文本生成", placeholder: "例如 gpt-4o-mini、gpt-5.5" },
+    { key: "video", label: "视频", hint: "视频生成和视频任务查询", placeholder: "例如 grok-imagine-video、seedance" },
 ];
 
 const apiFormatOptions: Array<{ label: string; value: ApiCallFormat }> = [
@@ -83,7 +96,7 @@ export function AppConfigModal() {
     };
 
     const finishConfig = async () => {
-        const ready = config.channels.some((channel) => channel.baseUrl.trim() && channel.apiKey.trim());
+        const ready = config.channels.some(channelHasPersistableEndpoint);
         if (!ready) {
             setConfigDialogOpen(false);
             return;
@@ -115,25 +128,21 @@ export function AppConfigModal() {
     };
 
     const updateChannel = (id: string, patch: Partial<ModelChannel>) => {
-        updateChannels(config.channels.map((channel) => (channel.id === id ? { ...channel, ...patch, models: patch.models ? uniqueModels(patch.models) : channel.models } : channel)));
+        updateChannels(config.channels.map((channel) => (channel.id === id ? syncChannelModels({ ...channel, ...patch }) : channel)));
     };
 
-    const updateChannelTextModels = (channel: ModelChannel, textModels: string[]) => {
-        const rawTextModels = uniqueModels(textModels.map(modelOptionName));
-        const channels = config.channels.map((item) => (item.id === channel.id ? { ...item, models: uniqueModels([...item.models, ...rawTextModels]) } : item));
-        const nextConfig = withChannels(config, channels);
-        const otherTextModels = config.textModels.filter((model) => !belongsToChannel(model, channel));
-        const nextTextModels = uniqueModels([...otherTextModels, ...rawTextModels.map((model) => normalizeModelOptionValue(model, channels)).filter(Boolean)]);
-        saveConfig({
-            ...nextConfig,
-            textModels: nextTextModels,
-            textModel: normalizeDefaultModel(config.textModel, nextTextModels) || nextTextModels[0] || "",
-        });
+    const updateChannelEndpoint = (channel: ModelChannel, key: ModelEndpointKey, patch: Partial<ModelEndpointConfig>) => {
+        const currentEndpoint = channel.endpoints[key];
+        const endpoint = createModelEndpoint({ ...currentEndpoint, ...patch }, { baseUrl: channel.baseUrl, apiKey: channel.apiKey, apiFormat: channel.apiFormat, models: channel.models }, key);
+        const nextEndpoint = patch.models ? { ...endpoint, models: uniqueModels(patch.models.map(modelOptionName)) } : endpoint;
+        const endpoints = { ...channel.endpoints, [key]: nextEndpoint };
+        updateChannel(channel.id, { endpoints });
     };
 
-    const updateChannelApiFormat = (channel: ModelChannel, apiFormat: ApiCallFormat) => {
-        const baseUrl = !channel.baseUrl.trim() || channel.baseUrl.trim() === defaultBaseUrlForApiFormat(channel.apiFormat) ? defaultBaseUrlForApiFormat(apiFormat) : channel.baseUrl;
-        updateChannel(channel.id, { apiFormat, baseUrl });
+    const updateEndpointApiFormat = (channel: ModelChannel, key: ModelEndpointKey, apiFormat: ApiCallFormat) => {
+        const endpoint = channel.endpoints[key];
+        const baseUrl = !endpoint.baseUrl.trim() || endpoint.baseUrl.trim() === defaultBaseUrlForApiFormat(endpoint.apiFormat) ? defaultBaseUrlForApiFormat(apiFormat) : endpoint.baseUrl;
+        updateChannelEndpoint(channel, key, { apiFormat, baseUrl });
     };
 
     const addChannel = () => {
@@ -148,16 +157,17 @@ export function AppConfigModal() {
         updateChannels(config.channels.filter((channel) => channel.id !== id));
     };
 
-    const refreshChannelModels = async (channel: ModelChannel) => {
-        if (!channel.baseUrl.trim() || !channel.apiKey.trim()) {
-            message.error("请先填写该渠道的 Base URL 和 API Key");
+    const refreshChannelEndpointModels = async (channel: ModelChannel, key: ModelEndpointKey) => {
+        const endpoint = channel.endpoints[key];
+        if (!endpoint.baseUrl.trim() || !endpoint.apiKey.trim()) {
+            message.error(`请先填写${endpointLabel(key)}端点的 Base URL 和 API Key`);
             return;
         }
-        setLoadingChannelId(channel.id);
+        setLoadingChannelId(`${channel.id}:${key}`);
         try {
-            const models = await fetchChannelModels(channel);
-            updateChannels(config.channels.map((item) => (item.id === channel.id ? { ...item, models } : item)));
-            message.success(`${channel.name} 模型列表已更新`);
+            const models = await fetchChannelEndpointModels(endpoint);
+            updateChannelEndpoint(channel, key, { models });
+            message.success(`${channel.name} ${endpointLabel(key)}模型列表已更新`);
         } catch (error) {
             message.error(error instanceof Error ? error.message : "读取模型失败");
         } finally {
@@ -166,16 +176,29 @@ export function AppConfigModal() {
     };
 
     const refreshAllModels = async () => {
-        const runnable = config.channels.filter((channel) => channel.baseUrl.trim() && channel.apiKey.trim());
+        const runnable = config.channels.flatMap((channel) =>
+            modelEndpointKeys
+                .map((key) => ({ channel, key, endpoint: channel.endpoints[key] }))
+                .filter(({ endpoint }) => endpoint.baseUrl.trim() && endpoint.apiKey.trim()),
+        );
         if (!runnable.length) {
             message.error("请先填写至少一个渠道的 Base URL 和 API Key");
             return;
         }
         setLoadingChannelId("all");
         try {
-            const entries = await Promise.all(runnable.map(async (channel) => [channel.id, await fetchChannelModels(channel)] as const));
+            const entries = await Promise.all(runnable.map(async ({ channel, key, endpoint }) => [`${channel.id}:${key}`, await fetchChannelEndpointModels(endpoint)] as const));
             const modelMap = new Map(entries);
-            updateChannels(config.channels.map((channel) => (modelMap.has(channel.id) ? { ...channel, models: modelMap.get(channel.id) || [] } : channel)));
+            updateChannels(
+                config.channels.map((channel) => {
+                    const endpoints = { ...channel.endpoints };
+                    modelEndpointKeys.forEach((key) => {
+                        const models = modelMap.get(`${channel.id}:${key}`);
+                        if (models) endpoints[key] = { ...endpoints[key], models };
+                    });
+                    return syncChannelModels({ ...channel, endpoints });
+                }),
+            );
             message.success("模型列表已更新");
         } catch (error) {
             message.error(error instanceof Error ? error.message : "读取模型失败");
@@ -295,45 +318,60 @@ export function AppConfigModal() {
                                             <div className="mb-3 flex items-center justify-between gap-3">
                                                 <div className="min-w-0">
                                                     <div className="truncate text-sm font-semibold">{channel.name || "未命名渠道"}</div>
-                                                    <div className="mt-1 text-xs text-stone-500">
-                                                        {apiFormatLabel(channel.apiFormat)} · 已保存 {channel.models.length} 个模型
-                                                    </div>
+                                                    <div className="mt-1 text-xs text-stone-500">{endpointSummary(channel)} · 共 {channelModels(channel).length} 个模型</div>
                                                 </div>
                                                 <div className="flex shrink-0 gap-2">
-                                                    <Button size="small" loading={loadingChannelId === channel.id} onClick={() => void refreshChannelModels(channel)}>
-                                                        拉取模型
-                                                    </Button>
                                                     <Button size="small" danger icon={<Trash2 className="size-3.5" />} onClick={() => deleteChannel(channel.id)} />
                                                 </div>
                                             </div>
-                                            <div className="grid gap-4 md:grid-cols-2">
+                                            <div className="mb-3 grid gap-4 md:grid-cols-2">
                                                 <Form.Item label="渠道名称" className="mb-0">
                                                     <Input value={channel.name} onChange={(event) => updateChannel(channel.id, { name: event.target.value })} />
                                                 </Form.Item>
-                                                <Form.Item label="调用格式" className="mb-0">
-                                                    <Select value={channel.apiFormat} options={apiFormatOptions} onChange={(value: ApiCallFormat) => updateChannelApiFormat(channel, value)} />
+                                                <Form.Item label="默认调用格式" className="mb-0">
+                                                    <Select value={channel.apiFormat} options={apiFormatOptions} onChange={(value: ApiCallFormat) => updateChannel(channel.id, { apiFormat: value, baseUrl: defaultBaseUrlForApiFormat(value) })} />
                                                 </Form.Item>
-                                                <Form.Item label="Base URL" className="mb-0">
-                                                    <Input value={channel.baseUrl} onChange={(event) => updateChannel(channel.id, { baseUrl: event.target.value })} />
-                                                </Form.Item>
-                                                <Form.Item label="API Key" className="mb-0">
-                                                    <Input.Password value={channel.apiKey} onChange={(event) => updateChannel(channel.id, { apiKey: event.target.value })} />
-                                                </Form.Item>
-                                                <Form.Item label="模型列表" className="mb-0 md:col-span-2">
-                                                    <Select mode="tags" showSearch allowClear maxTagCount="responsive" placeholder="输入模型名，或点击拉取模型" value={channel.models} onChange={(models) => updateChannel(channel.id, { models })} />
-                                                </Form.Item>
-                                                <Form.Item label="文本模型" extra="用于画布助手、提示词优化和文本生成；可直接输入模型名。" className="mb-0 md:col-span-2">
-                                                    <Select
-                                                        mode="tags"
-                                                        showSearch
-                                                        allowClear
-                                                        maxTagCount="responsive"
-                                                        placeholder="例如 gpt-4o-mini、gpt-5.5"
-                                                        value={channelTextModels(config, channel)}
-                                                        options={channel.models.map((model) => ({ label: model, value: model }))}
-                                                        onChange={(models) => updateChannelTextModels(channel, models)}
-                                                    />
-                                                </Form.Item>
+                                            </div>
+                                            <div className="space-y-4">
+                                                {endpointGroups.map((group) => {
+                                                    const endpoint = channel.endpoints[group.key];
+                                                    const loadingKey = `${channel.id}:${group.key}`;
+                                                    return (
+                                                        <div key={group.key} className="border-t border-stone-200 pt-4 first:border-t-0 first:pt-0 dark:border-stone-800">
+                                                            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                                                                <div>
+                                                                    <div className="text-sm font-medium">{group.label}模型地址</div>
+                                                                    <div className="mt-0.5 text-xs text-stone-500">{group.hint}</div>
+                                                                </div>
+                                                                <Button size="small" loading={loadingChannelId === loadingKey} onClick={() => void refreshChannelEndpointModels(channel, group.key)}>
+                                                                    拉取{group.label}模型
+                                                                </Button>
+                                                            </div>
+                                                            <div className="grid gap-4 md:grid-cols-2">
+                                                                <Form.Item label="调用格式" className="mb-0">
+                                                                    <Select value={endpoint.apiFormat} options={apiFormatOptions} onChange={(value: ApiCallFormat) => updateEndpointApiFormat(channel, group.key, value)} />
+                                                                </Form.Item>
+                                                                <Form.Item label="Base URL" className="mb-0">
+                                                                    <Input value={endpoint.baseUrl} onChange={(event) => updateChannelEndpoint(channel, group.key, { baseUrl: event.target.value })} />
+                                                                </Form.Item>
+                                                                <Form.Item label="API Key" className="mb-0 md:col-span-2">
+                                                                    <Input.Password value={endpoint.apiKey} onChange={(event) => updateChannelEndpoint(channel, group.key, { apiKey: event.target.value })} />
+                                                                </Form.Item>
+                                                                <Form.Item label={`${group.label}模型列表`} className="mb-0 md:col-span-2">
+                                                                    <Select
+                                                                        mode="tags"
+                                                                        showSearch
+                                                                        allowClear
+                                                                        maxTagCount="responsive"
+                                                                        placeholder={group.placeholder}
+                                                                        value={endpoint.models}
+                                                                        onChange={(models) => updateChannelEndpoint(channel, group.key, { models })}
+                                                                    />
+                                                                </Form.Item>
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                })}
                                             </div>
                                         </section>
                                     ))}
@@ -481,18 +519,20 @@ export function AppConfigModal() {
 }
 
 function withChannels(config: AiConfig, channels: ModelChannel[]): AiConfig {
-    const models = modelOptionsFromChannels(channels);
+    const normalizedChannels = channels.map(syncChannelModels);
+    const models = modelOptionsFromChannels(normalizedChannels);
     const imageModels = keepOrSuggest(config.imageModels, filterModelsByCapability(models, "image"), models);
     const videoModels = keepOrSuggest(config.videoModels, filterModelsByCapability(models, "video"), models);
     const textModels = keepOrSuggest(config.textModels, filterModelsByCapability(models, "text"), models);
     const audioModels = keepOrSuggest(config.audioModels, filterModelsByCapability(models, "audio"), models);
+    const firstEndpoint = firstConfiguredEndpoint(normalizedChannels[0]) || normalizedChannels[0]?.endpoints.image;
     return {
         ...config,
-        channels,
+        channels: normalizedChannels,
         models,
-        baseUrl: channels[0]?.baseUrl || config.baseUrl,
-        apiKey: channels[0]?.apiKey || config.apiKey,
-        apiFormat: channels[0]?.apiFormat || config.apiFormat,
+        baseUrl: firstEndpoint?.baseUrl || config.baseUrl,
+        apiKey: firstEndpoint?.apiKey || config.apiKey,
+        apiFormat: firstEndpoint?.apiFormat || config.apiFormat,
         imageModels,
         videoModels,
         textModels,
@@ -505,29 +545,51 @@ function withChannels(config: AiConfig, channels: ModelChannel[]): AiConfig {
 }
 
 function isPersistableServerChannel(channel: ModelChannel) {
-    const baseUrl = channel.baseUrl.trim();
-    const apiKey = channel.apiKey.trim();
-    return Boolean(baseUrl && apiKey && baseUrl !== "/api/ai" && apiKey !== SERVER_API_KEY_PLACEHOLDER);
+    return channelHasPersistableEndpoint(channel);
 }
 
-function belongsToChannel(model: string, channel: ModelChannel) {
-    const decoded = decodeChannelModel(model);
-    if (decoded) return decoded.channelId === channel.id;
-    return channel.models.includes(modelOptionName(model));
+function channelHasPersistableEndpoint(channel: ModelChannel) {
+    return modelEndpointKeys.some((key) => isPersistableEndpoint(channel.endpoints[key]));
 }
 
-function channelTextModels(config: AiConfig, channel: ModelChannel) {
-    return config.textModels.filter((model) => belongsToChannel(model, channel)).map(modelOptionName);
+function isPersistableEndpoint(endpoint: ModelEndpointConfig) {
+    const baseUrl = endpoint.baseUrl.trim();
+    const apiKey = endpoint.apiKey.trim();
+    return Boolean(baseUrl && apiKey && !baseUrl.startsWith("/api/ai") && apiKey !== SERVER_API_KEY_PLACEHOLDER);
+}
+
+function firstConfiguredEndpoint(channel?: ModelChannel) {
+    if (!channel) return undefined;
+    return modelEndpointKeys.map((key) => channel.endpoints[key]).find((endpoint) => endpoint.baseUrl.trim() && endpoint.apiKey.trim());
+}
+
+function syncChannelModels(channel: ModelChannel) {
+    return { ...channel, models: uniqueModels(modelEndpointKeys.flatMap((key) => channel.endpoints[key]?.models || [])) };
 }
 
 async function saveServerConfig(config: AiConfig, channel: ModelChannel): Promise<ServerConfig> {
+    const endpoints = Object.fromEntries(
+        modelEndpointKeys.map((key) => {
+            const endpoint = channel.endpoints[key];
+            return [
+                key,
+                {
+                    apiFormat: "openai",
+                    baseUrl: endpoint.baseUrl,
+                    apiKey: endpoint.apiKey,
+                    models: endpoint.models.map(modelOptionName),
+                },
+            ];
+        }),
+    );
     const payload = {
         enabled: true,
         channelName: channel.name || "服务器渠道",
         apiFormat: "openai",
-        baseUrl: channel.baseUrl,
-        apiKey: channel.apiKey,
-        models: channel.models.map(modelOptionName),
+        baseUrl: firstConfiguredEndpoint(channel)?.baseUrl || channel.baseUrl,
+        apiKey: firstConfiguredEndpoint(channel)?.apiKey || channel.apiKey,
+        endpoints,
+        models: channelModels(channel).map(modelOptionName),
         imageModels: config.imageModels.map(modelOptionName),
         videoModels: config.videoModels.map(modelOptionName),
         textModels: config.textModels.map(modelOptionName),
@@ -549,6 +611,14 @@ async function saveServerConfig(config: AiConfig, channel: ModelChannel): Promis
     return data as ServerConfig;
 }
 
+function endpointSummary(channel: ModelChannel) {
+    return endpointGroups.map((group) => `${group.label} ${channel.endpoints[group.key].models.length}`).join(" · ");
+}
+
+function endpointLabel(key: ModelEndpointKey) {
+    return endpointGroups.find((group) => group.key === key)?.label || key;
+}
+
 function keepOrSuggest(current: string[], suggested: string[], allModels: string[]) {
     const available = new Set(allModels);
     const kept = uniqueModels(current).filter((model) => available.has(model));
@@ -566,10 +636,6 @@ function normalizeImageCount(value: string) {
 
 function uniqueModels(models: string[]) {
     return Array.from(new Set(models.map((model) => model.trim()).filter(Boolean)));
-}
-
-function apiFormatLabel(apiFormat: ApiCallFormat) {
-    return apiFormat === "gemini" ? "Gemini" : "OpenAI";
 }
 
 function formatWebdavTime(value: string) {

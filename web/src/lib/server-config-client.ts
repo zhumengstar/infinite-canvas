@@ -1,10 +1,17 @@
-import { createModelChannel, type AiConfig } from "@/stores/use-config-store";
+import { createModelChannel, type AiConfig, type ModelEndpointKey } from "@/stores/use-config-store";
+
+type ServerEndpointConfig = {
+    apiFormat: "openai";
+    proxyBaseUrl: string;
+    models: string[];
+};
 
 export type ServerConfig = {
     enabled: boolean;
     channelName: string;
     apiFormat: "openai";
     proxyBaseUrl: string;
+    endpoints?: Partial<Record<ModelEndpointKey, ServerEndpointConfig>>;
     models: string[];
     imageModels: string[];
     videoModels: string[];
@@ -24,6 +31,11 @@ type UpdateConfig = <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => vo
 export function applyServerConfig(updateConfig: UpdateConfig, serverConfig: ServerConfig) {
     if (!serverConfig.enabled) return;
     const channelModels = uniqueModels(serverConfig.models);
+    const endpoints = {
+        image: createServerEndpoint(serverConfig, "image", serverConfig.imageModels),
+        text: createServerEndpoint(serverConfig, "text", serverConfig.textModels),
+        video: createServerEndpoint(serverConfig, "video", serverConfig.videoModels),
+    };
     const channel = createModelChannel({
         id: SERVER_CHANNEL_ID,
         name: serverConfig.channelName || "服务器渠道",
@@ -31,6 +43,7 @@ export function applyServerConfig(updateConfig: UpdateConfig, serverConfig: Serv
         apiKey: SERVER_API_KEY_PLACEHOLDER,
         apiFormat: serverConfig.apiFormat || "openai",
         models: channelModels,
+        endpoints,
     });
     const modelValue = (model: string) => (model ? `${SERVER_CHANNEL_ID}::${model}` : "");
     const imageModels = uniqueModels(serverConfig.imageModels).map(modelValue).filter(Boolean);
@@ -53,6 +66,16 @@ export function applyServerConfig(updateConfig: UpdateConfig, serverConfig: Serv
     updateConfig("textModel", normalizeServerDefault(serverConfig.textModel, textModels));
     updateConfig("audioModel", normalizeServerDefault(serverConfig.audioModel, audioModels));
     updateConfig("model", normalizeServerDefault(serverConfig.imageModel, imageModels) || models[0] || "");
+}
+
+function createServerEndpoint(serverConfig: ServerConfig, key: ModelEndpointKey, fallbackModels: string[]) {
+    const endpoint = serverConfig.endpoints?.[key];
+    return {
+        apiFormat: endpoint?.apiFormat || serverConfig.apiFormat || "openai",
+        baseUrl: endpoint?.proxyBaseUrl || `${serverConfig.proxyBaseUrl || "/api/ai"}/${key}`,
+        apiKey: SERVER_API_KEY_PLACEHOLDER,
+        models: uniqueModels(endpoint?.models?.length ? endpoint.models : fallbackModels),
+    };
 }
 
 function normalizeServerDefault(model: string, options: string[]) {

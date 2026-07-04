@@ -1,6 +1,26 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
+export type ServerEndpointKey = "image" | "text" | "video";
+
+export type PersistedServerEndpointConfig = {
+    apiFormat?: "openai";
+    baseUrl?: string;
+    apiKey?: string;
+    models?: string[];
+};
+
+export type PublicServerEndpointConfig = {
+    apiFormat: "openai";
+    proxyBaseUrl: string;
+    models: string[];
+};
+
+export type ResolvedServerEndpointConfig = PublicServerEndpointConfig & {
+    baseUrl: string;
+    apiKey: string;
+};
+
 export type PersistedServerAiConfig = {
     enabled?: boolean;
     channelName?: string;
@@ -8,6 +28,7 @@ export type PersistedServerAiConfig = {
     baseUrl?: string;
     apiKey?: string;
     models?: string[];
+    endpoints?: Partial<Record<ServerEndpointKey, PersistedServerEndpointConfig>>;
     imageModels?: string[];
     videoModels?: string[];
     textModels?: string[];
@@ -23,6 +44,7 @@ export type PublicServerAiConfig = {
     channelName: string;
     apiFormat: "openai";
     proxyBaseUrl: string;
+    endpoints: Record<ServerEndpointKey, PublicServerEndpointConfig>;
     models: string[];
     imageModels: string[];
     videoModels: string[];
@@ -37,8 +59,10 @@ export type PublicServerAiConfig = {
 export type ResolvedServerAiConfig = PublicServerAiConfig & {
     baseUrl: string;
     apiKey: string;
+    endpoints: Record<ServerEndpointKey, ResolvedServerEndpointConfig>;
 };
 
+const endpointKeys: ServerEndpointKey[] = ["image", "text", "video"];
 const defaultImageModels = ["gpt-image-2"];
 const defaultVideoModels = ["grok-imagine-video"];
 const defaultTextModels = ["gpt-5.5"];
@@ -46,21 +70,29 @@ const defaultAudioModels = ["gpt-4o-mini-tts"];
 
 export async function readResolvedServerAiConfig(): Promise<ResolvedServerAiConfig> {
     const persisted = await readPersistedServerAiConfig();
-    const baseUrl = firstValue(persisted.baseUrl, process.env.CANVAS_AI_BASE_URL);
-    const apiKey = firstValue(persisted.apiKey, process.env.CANVAS_AI_API_KEY);
-    const imageModels = withDefault(splitValues(persisted.imageModels, "CANVAS_IMAGE_MODELS", defaultImageModels), persisted.imageModel || process.env.CANVAS_DEFAULT_IMAGE_MODEL);
-    const videoModels = withDefault(splitValues(persisted.videoModels, "CANVAS_VIDEO_MODELS", defaultVideoModels), persisted.videoModel || process.env.CANVAS_DEFAULT_VIDEO_MODEL);
-    const textModels = withDefault(splitValues(persisted.textModels, "CANVAS_TEXT_MODELS", defaultTextModels), persisted.textModel || process.env.CANVAS_DEFAULT_TEXT_MODEL);
+    const hasEndpointConfig = Boolean(persisted.endpoints);
+    const legacyBaseUrl = firstValue(hasEndpointConfig ? undefined : persisted.baseUrl, process.env.CANVAS_AI_BASE_URL);
+    const legacyApiKey = firstValue(hasEndpointConfig ? undefined : persisted.apiKey, process.env.CANVAS_AI_API_KEY);
+    const imageModels = withDefault(splitValues(persisted.imageModels?.length ? persisted.imageModels : persisted.endpoints?.image?.models, "CANVAS_IMAGE_MODELS", defaultImageModels), persisted.imageModel || process.env.CANVAS_DEFAULT_IMAGE_MODEL);
+    const videoModels = withDefault(splitValues(persisted.videoModels?.length ? persisted.videoModels : persisted.endpoints?.video?.models, "CANVAS_VIDEO_MODELS", defaultVideoModels), persisted.videoModel || process.env.CANVAS_DEFAULT_VIDEO_MODEL);
+    const textModels = withDefault(splitValues(persisted.textModels?.length ? persisted.textModels : persisted.endpoints?.text?.models, "CANVAS_TEXT_MODELS", defaultTextModels), persisted.textModel || process.env.CANVAS_DEFAULT_TEXT_MODEL);
     const audioModels = withDefault(splitValues(persisted.audioModels, "CANVAS_AUDIO_MODELS", defaultAudioModels), persisted.audioModel || process.env.CANVAS_DEFAULT_AUDIO_MODEL);
     const models = unique([...imageModels, ...videoModels, ...textModels, ...audioModels, ...splitValues(persisted.models, "CANVAS_MODELS", [])]);
-    const enabledByPersisted = persisted.enabled !== false && Boolean(persisted.baseUrl && persisted.apiKey);
+    const endpoints: Record<ServerEndpointKey, ResolvedServerEndpointConfig> = {
+        image: resolveEndpoint("image", persisted.endpoints?.image, legacyBaseUrl, legacyApiKey, imageModels),
+        text: resolveEndpoint("text", persisted.endpoints?.text, legacyBaseUrl, legacyApiKey, textModels),
+        video: resolveEndpoint("video", persisted.endpoints?.video, legacyBaseUrl, legacyApiKey, videoModels),
+    };
+    const firstEndpoint = endpointKeys.map((key) => endpoints[key]).find((endpoint) => endpoint.baseUrl && endpoint.apiKey);
+    const enabledByPersisted = persisted.enabled !== false && Boolean(firstEndpoint) && (Boolean(persisted.baseUrl && persisted.apiKey) || endpointKeys.some((key) => Boolean(persisted.endpoints?.[key]?.baseUrl && persisted.endpoints?.[key]?.apiKey)));
     const enabledByEnv = envBool("CANVAS_SERVER_AI_ENABLED") && Boolean(process.env.CANVAS_AI_BASE_URL && process.env.CANVAS_AI_API_KEY);
 
     return {
-        enabled: Boolean((enabledByPersisted || enabledByEnv) && baseUrl && apiKey),
+        enabled: Boolean((enabledByPersisted || enabledByEnv) && firstEndpoint),
         channelName: persisted.channelName || process.env.CANVAS_AI_CHANNEL_NAME || "服务器渠道",
         apiFormat: "openai",
         proxyBaseUrl: "/api/ai",
+        endpoints,
         models,
         imageModels,
         videoModels,
@@ -70,8 +102,8 @@ export async function readResolvedServerAiConfig(): Promise<ResolvedServerAiConf
         videoModel: persisted.videoModel || process.env.CANVAS_DEFAULT_VIDEO_MODEL || videoModels[0] || models[0] || "",
         textModel: persisted.textModel || process.env.CANVAS_DEFAULT_TEXT_MODEL || textModels[0] || models[0] || "",
         audioModel: persisted.audioModel || process.env.CANVAS_DEFAULT_AUDIO_MODEL || audioModels[0] || models[0] || "",
-        baseUrl,
-        apiKey,
+        baseUrl: firstEndpoint?.baseUrl || legacyBaseUrl,
+        apiKey: firstEndpoint?.apiKey || legacyApiKey,
     };
 }
 
@@ -81,6 +113,11 @@ export function toPublicServerAiConfig(config: ResolvedServerAiConfig): PublicSe
         channelName: config.channelName,
         apiFormat: config.apiFormat,
         proxyBaseUrl: config.proxyBaseUrl,
+        endpoints: {
+            image: publicEndpoint(config.endpoints.image),
+            text: publicEndpoint(config.endpoints.text),
+            video: publicEndpoint(config.endpoints.video),
+        },
         models: config.models,
         imageModels: config.imageModels,
         videoModels: config.videoModels,
@@ -94,21 +131,43 @@ export function toPublicServerAiConfig(config: ResolvedServerAiConfig): PublicSe
 }
 
 export async function saveServerAiConfig(input: PersistedServerAiConfig) {
-    const baseUrl = input.baseUrl?.trim().replace(/\/+$/, "") || "";
-    const apiKey = input.apiKey?.trim() || "";
-    if (!baseUrl) throw new Error("请填写 Base URL");
-    if (!apiKey) throw new Error("请填写 API Key");
+    const legacyBaseUrl = input.baseUrl?.trim().replace(/\/+$/, "") || "";
+    const legacyApiKey = input.apiKey?.trim() || "";
+    const inputEndpoints = input.endpoints || {};
+    const endpoints: Partial<Record<ServerEndpointKey, PersistedServerEndpointConfig>> = {};
+
+    for (const key of endpointKeys) {
+        const endpointInput = inputEndpoints[key];
+        const baseUrl = endpointInput?.baseUrl?.trim().replace(/\/+$/, "") || legacyBaseUrl;
+        const apiKey = endpointInput?.apiKey?.trim() || legacyApiKey;
+        const hasLegacyFallback = !input.endpoints && Boolean(legacyBaseUrl && legacyApiKey);
+        const hasAnyValue = Boolean(endpointInput?.apiKey || endpointInput?.models?.length || hasLegacyFallback);
+        if (!hasAnyValue) continue;
+        if (!baseUrl) throw new Error(`请填写${endpointLabel(key)} Base URL`);
+        if (!apiKey) throw new Error(`请填写${endpointLabel(key)} API Key`);
+        endpoints[key] = {
+            apiFormat: "openai",
+            baseUrl,
+            apiKey,
+            models: unique(endpointInput?.models || []),
+        };
+    }
+
+    if (!endpointKeys.some((key) => endpoints[key]?.baseUrl && endpoints[key]?.apiKey)) {
+        throw new Error("请至少填写一个模型地址和 API Key");
+    }
 
     const normalized: PersistedServerAiConfig = {
         enabled: input.enabled !== false,
         channelName: input.channelName?.trim() || "服务器渠道",
         apiFormat: "openai",
-        baseUrl,
-        apiKey,
+        baseUrl: legacyBaseUrl || firstSavedEndpoint(endpoints)?.baseUrl || "",
+        apiKey: legacyApiKey || firstSavedEndpoint(endpoints)?.apiKey || "",
+        endpoints,
         models: unique(input.models || []),
-        imageModels: unique(input.imageModels || []),
-        videoModels: unique(input.videoModels || []),
-        textModels: unique(input.textModels || []),
+        imageModels: unique(input.imageModels || endpoints.image?.models || []),
+        videoModels: unique(input.videoModels || endpoints.video?.models || []),
+        textModels: unique(input.textModels || endpoints.text?.models || []),
         audioModels: unique(input.audioModels || []),
         imageModel: input.imageModel?.trim() || "",
         videoModel: input.videoModel?.trim() || "",
@@ -116,13 +175,21 @@ export async function saveServerAiConfig(input: PersistedServerAiConfig) {
         audioModel: input.audioModel?.trim() || "",
     };
 
-    if (!normalized.models?.length) {
-        normalized.models = await fetchOpenAiModelIds(baseUrl, apiKey).catch(() => []);
+    for (const key of endpointKeys) {
+        const endpoint = normalized.endpoints?.[key];
+        if (!endpoint) continue;
+        if (!endpoint.models?.length) {
+            endpoint.models = await fetchOpenAiModelIds(endpoint.baseUrl || "", endpoint.apiKey || "").catch(() => []);
+        }
     }
-    normalized.imageModels = withDefault(normalized.imageModels?.length ? normalized.imageModels : filterModels(normalized.models || [], "image"), normalized.imageModel || undefined);
-    normalized.videoModels = withDefault(normalized.videoModels?.length ? normalized.videoModels : filterModels(normalized.models || [], "video"), normalized.videoModel || undefined);
-    normalized.textModels = withDefault(normalized.textModels?.length ? normalized.textModels : filterModels(normalized.models || [], "text"), normalized.textModel || undefined);
-    normalized.audioModels = withDefault(normalized.audioModels?.length ? normalized.audioModels : filterModels(normalized.models || [], "audio"), normalized.audioModel || undefined);
+
+    normalized.imageModels = withDefault(normalized.imageModels?.length ? normalized.imageModels : filterModels(normalized.endpoints?.image?.models || normalized.models || [], "image"), normalized.imageModel || undefined);
+    normalized.videoModels = withDefault(normalized.videoModels?.length ? normalized.videoModels : filterModels(normalized.endpoints?.video?.models || normalized.models || [], "video"), normalized.videoModel || undefined);
+    normalized.textModels = withDefault(normalized.textModels?.length ? normalized.textModels : filterModels(normalized.endpoints?.text?.models || normalized.models || [], "text"), normalized.textModel || undefined);
+    normalized.audioModels = withDefault(normalized.audioModels?.length ? normalized.audioModels : defaultAudioModels, normalized.audioModel || undefined);
+    if (normalized.endpoints?.image) normalized.endpoints.image.models = normalized.imageModels;
+    if (normalized.endpoints?.video) normalized.endpoints.video.models = normalized.videoModels;
+    if (normalized.endpoints?.text) normalized.endpoints.text.models = normalized.textModels;
     normalized.models = unique([...(normalized.models || []), ...normalized.imageModels, ...normalized.videoModels, ...normalized.textModels, ...normalized.audioModels]);
     normalized.imageModel = normalized.imageModel || normalized.imageModels[0] || "";
     normalized.videoModel = normalized.videoModel || normalized.videoModels[0] || "";
@@ -147,6 +214,28 @@ async function readPersistedServerAiConfig(): Promise<PersistedServerAiConfig> {
 
 function serverConfigPath() {
     return process.env.CANVAS_SERVER_CONFIG_PATH || "/data/server-ai-config.json";
+}
+
+function resolveEndpoint(key: ServerEndpointKey, endpoint: PersistedServerEndpointConfig | undefined, legacyBaseUrl: string, legacyApiKey: string, models: string[]): ResolvedServerEndpointConfig {
+    return {
+        apiFormat: "openai",
+        proxyBaseUrl: `/api/ai/${key}`,
+        baseUrl: firstValue(endpoint?.baseUrl, legacyBaseUrl),
+        apiKey: firstValue(endpoint?.apiKey, legacyApiKey),
+        models: unique(endpoint?.models?.length ? endpoint.models : models),
+    };
+}
+
+function publicEndpoint(endpoint: ResolvedServerEndpointConfig): PublicServerEndpointConfig {
+    return {
+        apiFormat: endpoint.apiFormat,
+        proxyBaseUrl: endpoint.proxyBaseUrl,
+        models: endpoint.models,
+    };
+}
+
+function firstSavedEndpoint(endpoints: Partial<Record<ServerEndpointKey, PersistedServerEndpointConfig>>) {
+    return endpointKeys.map((key) => endpoints[key]).find((endpoint) => endpoint?.baseUrl && endpoint.apiKey);
 }
 
 function firstValue(...values: Array<string | undefined>) {
@@ -212,4 +301,10 @@ function buildApiUrl(baseUrl: string, path: string) {
     const lowerBaseUrl = normalizedBaseUrl.toLowerCase();
     const apiBaseUrl = lowerBaseUrl.endsWith("/v1") || lowerBaseUrl.endsWith("/api/v3") || lowerBaseUrl.endsWith("/api/plan/v3") ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
     return `${apiBaseUrl}${path}`;
+}
+
+function endpointLabel(key: ServerEndpointKey) {
+    if (key === "image") return "图片";
+    if (key === "video") return "视频";
+    return "文本";
 }

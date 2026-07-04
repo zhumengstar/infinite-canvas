@@ -1,6 +1,6 @@
 import axios from "axios";
 
-import { buildApiUrl, resolveModelRequestConfig, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import { buildApiUrl, resolveModelRequestConfig, type AiConfig, type ModelEndpointConfig } from "@/stores/use-config-store";
 import { nanoid } from "nanoid";
 import { dataUrlToFile } from "@/lib/image-utils";
 import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
@@ -608,7 +608,7 @@ function parseGeminiImagePayload(payload: GeminiPayload) {
 }
 
 export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
-    const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
+    const requestConfig = resolveModelRequestConfig(config, config.imageModel || config.model, "image");
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     if (requestConfig.apiFormat === "gemini") {
         try {
@@ -644,7 +644,7 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
 }
 
 export async function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], mask?: ReferenceImage, options?: RequestOptions) {
-    const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
+    const requestConfig = resolveModelRequestConfig(config, config.imageModel || config.model, "image");
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const requestPrompt = buildImageReferencePromptText(prompt, references);
     if (requestConfig.apiFormat === "gemini") {
@@ -683,7 +683,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
 }
 
 export async function requestImageQuestion(config: AiConfig, messages: AiTextMessage[], onDelta: (text: string) => void, options?: RequestOptions) {
-    const requestConfig = resolveModelRequestConfig(config, config.model || config.textModel);
+    const requestConfig = resolveModelRequestConfig(config, config.textModel || config.model, "text");
     try {
         if (requestConfig.apiFormat === "gemini") {
             const answer = (await requestGeminiStreamingResponse(requestConfig, toGeminiBody(requestConfig, messages), onDelta, options)).content || "没有返回内容";
@@ -702,7 +702,7 @@ export async function requestImageQuestion(config: AiConfig, messages: AiTextMes
 }
 
 export async function requestToolResponse(config: AiConfig, messages: ResponseInputMessage[], tools: ResponseFunctionTool[], toolChoice: ToolChoice = "auto", onDelta?: (text: string) => void, options?: RequestOptions): Promise<ToolResponseResult> {
-    const requestConfig = resolveModelRequestConfig(config, config.model || config.textModel);
+    const requestConfig = resolveModelRequestConfig(config, config.textModel || config.model, "text");
     try {
         if (requestConfig.apiFormat === "gemini") {
             return await requestGeminiStreamingResponse(requestConfig, toGeminiBody(requestConfig, messages, toGeminiToolOptions(tools, toolChoice)), onDelta, options);
@@ -743,8 +743,8 @@ export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKe
     }
 }
 
-export async function fetchChannelModels(channel: ModelChannel) {
-    return fetchImageModels({ baseUrl: channel.baseUrl, apiKey: channel.apiKey, apiFormat: channel.apiFormat });
+export async function fetchChannelEndpointModels(endpoint: ModelEndpointConfig) {
+    return fetchImageModels({ baseUrl: endpoint.baseUrl, apiKey: endpoint.apiKey, apiFormat: endpoint.apiFormat });
 }
 
 const defaultGeminiConfig: Pick<AiConfig, "baseUrl" | "apiKey" | "apiFormat" | "model" | "systemPrompt"> = {

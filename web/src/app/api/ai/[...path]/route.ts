@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { readResolvedServerAiConfig } from "../../server-ai-config-store";
+import { readResolvedServerAiConfig, type ServerEndpointKey } from "../../server-ai-config-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -36,15 +36,16 @@ export async function HEAD(request: NextRequest, context: RouteContext) {
 
 async function proxyAiRequest(request: NextRequest, context: RouteContext) {
     const serverConfig = await readResolvedServerAiConfig();
-    const baseUrl = serverConfig.baseUrl.trim().replace(/\/+$/, "");
-    const apiKey = serverConfig.apiKey.trim();
+    const params = await context.params;
+    const pathParts = params.path || [];
+    const route = resolveProxyRoute(serverConfig, pathParts);
+    const baseUrl = route.baseUrl.trim().replace(/\/+$/, "");
+    const apiKey = route.apiKey.trim();
     if (!baseUrl || !apiKey) return new Response("Server AI proxy is not configured", { status: 503 });
 
     let target: URL;
     try {
-        const params = await context.params;
-        const pathParts = params.path || [];
-        const path = normalizeTargetPath(baseUrl, pathParts);
+        const path = normalizeTargetPath(baseUrl, route.pathParts);
         target = new URL(`${baseUrl}/${path}${request.nextUrl.search}`);
     } catch {
         return new Response("Invalid AI proxy target", { status: 400 });
@@ -66,6 +67,19 @@ async function proxyAiRequest(request: NextRequest, context: RouteContext) {
         statusText: response.statusText,
         headers: responseHeaders(response.headers),
     });
+}
+
+function resolveProxyRoute(config: Awaited<ReturnType<typeof readResolvedServerAiConfig>>, pathParts: string[]) {
+    const firstPart = pathParts[0]?.toLowerCase();
+    if (isEndpointKey(firstPart)) {
+        const endpoint = config.endpoints[firstPart];
+        return { baseUrl: endpoint.baseUrl, apiKey: endpoint.apiKey, pathParts: pathParts.slice(1) };
+    }
+    return { baseUrl: config.baseUrl, apiKey: config.apiKey, pathParts };
+}
+
+function isEndpointKey(value: string | undefined): value is ServerEndpointKey {
+    return value === "image" || value === "text" || value === "video";
 }
 
 function normalizeTargetPath(baseUrl: string, pathParts: string[]) {

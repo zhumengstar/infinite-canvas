@@ -6,6 +6,14 @@ import { persist } from "zustand/middleware";
 import { nanoid } from "nanoid";
 
 export type ApiCallFormat = "openai" | "gemini";
+export type ModelEndpointKey = "image" | "text" | "video";
+
+export type ModelEndpointConfig = {
+    baseUrl: string;
+    apiKey: string;
+    apiFormat: ApiCallFormat;
+    models: string[];
+};
 
 export type ModelChannel = {
     id: string;
@@ -14,6 +22,7 @@ export type ModelChannel = {
     apiKey: string;
     apiFormat: ApiCallFormat;
     models: string[];
+    endpoints: Record<ModelEndpointKey, ModelEndpointConfig>;
 };
 
 export type AiConfig = {
@@ -61,6 +70,7 @@ export type ModelCapability = "image" | "video" | "text" | "audio";
 const CHANNEL_MODEL_SEPARATOR = "::";
 const OPENAI_BASE_URL = "https://api.openai.com";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
+export const modelEndpointKeys: ModelEndpointKey[] = ["image", "text", "video"];
 
 export const defaultConfig: AiConfig = {
     channelMode: "local",
@@ -75,6 +85,11 @@ export const defaultConfig: AiConfig = {
             apiKey: "",
             apiFormat: "openai",
             models: ["gpt-image-2", "grok-imagine-video", "gpt-5.5", "gpt-4o-mini-tts"],
+            endpoints: {
+                image: { baseUrl: OPENAI_BASE_URL, apiKey: "", apiFormat: "openai", models: ["gpt-image-2"] },
+                text: { baseUrl: OPENAI_BASE_URL, apiKey: "", apiFormat: "openai", models: ["gpt-5.5"] },
+                video: { baseUrl: OPENAI_BASE_URL, apiKey: "", apiFormat: "openai", models: ["grok-imagine-video"] },
+            },
         },
     ],
     model: "default::gpt-image-2",
@@ -165,8 +180,8 @@ function modelListKey(capability: ModelCapability) {
 }
 
 function isAiConfigReady(config: AiConfig, model: string) {
-    const channel = resolveModelChannel(config, model);
-    return Boolean(model.trim() && channel.baseUrl.trim() && channel.apiKey.trim());
+    const requestConfig = resolveModelRequestConfig(config, model);
+    return Boolean(model.trim() && requestConfig.baseUrl.trim() && requestConfig.apiKey.trim());
 }
 
 export const useConfigStore = create<ConfigStore>()(
@@ -240,7 +255,7 @@ export const useConfigStore = create<ConfigStore>()(
 );
 
 function normalizeModelList(models: string[], channels: ModelChannel[]) {
-    const allModelOptions = channels.flatMap((channel) => channel.models.map((model) => encodeChannelModel(channel.id, model)));
+    const allModelOptions = channels.flatMap((channel) => channelModels(channel).map((model) => encodeChannelModel(channel.id, model)));
     return Array.from(new Set((models || []).map((model) => model.trim()).filter(Boolean)))
         .map((model) => normalizeModelOptionValue(model, channels))
         .filter((model) => !allModelOptions.length || allModelOptions.includes(model) || !isChannelModelValue(model));
@@ -253,13 +268,40 @@ export function useEffectiveConfig() {
 
 export function createModelChannel(channel?: Partial<ModelChannel>): ModelChannel {
     const apiFormat = normalizeApiFormat(channel?.apiFormat);
+    const baseUrl = channel?.baseUrl?.trim() || defaultBaseUrlForApiFormat(apiFormat);
+    const apiKey = channel?.apiKey || "";
+    const models = uniqueRawModels(channel?.models || []);
+    const fallback: ModelEndpointConfig = { baseUrl, apiKey, apiFormat, models };
+    const endpoints = createChannelEndpoints(channel?.endpoints, fallback);
+    const mergedModels = uniqueRawModels([...models, ...modelEndpointKeys.flatMap((key) => endpoints[key].models)]);
     return {
         id: channel?.id?.trim() || nanoid(),
         name: channel?.name?.trim() || "新渠道",
-        baseUrl: channel?.baseUrl?.trim() || defaultBaseUrlForApiFormat(apiFormat),
-        apiKey: channel?.apiKey || "",
+        baseUrl,
+        apiKey,
         apiFormat,
-        models: uniqueRawModels(channel?.models || []),
+        models: mergedModels,
+        endpoints,
+    };
+}
+
+export function createModelEndpoint(endpoint?: Partial<ModelEndpointConfig>, fallback?: Partial<ModelEndpointConfig>, capability?: ModelEndpointKey): ModelEndpointConfig {
+    const apiFormat = normalizeApiFormat(endpoint?.apiFormat || fallback?.apiFormat);
+    const fallbackModels = fallback?.models || [];
+    const suggestedModels = capability ? filterModelsByCapability(fallbackModels, capability) : fallbackModels;
+    return {
+        baseUrl: endpoint?.baseUrl?.trim() || fallback?.baseUrl?.trim() || defaultBaseUrlForApiFormat(apiFormat),
+        apiKey: endpoint?.apiKey ?? fallback?.apiKey ?? "",
+        apiFormat,
+        models: uniqueRawModels(endpoint?.models?.length ? endpoint.models : suggestedModels),
+    };
+}
+
+function createChannelEndpoints(endpoints: Partial<Record<ModelEndpointKey, Partial<ModelEndpointConfig>>> | undefined, fallback: ModelEndpointConfig): Record<ModelEndpointKey, ModelEndpointConfig> {
+    return {
+        image: createModelEndpoint(endpoints?.image, fallback, "image"),
+        text: createModelEndpoint(endpoints?.text, fallback, "text"),
+        video: createModelEndpoint(endpoints?.video, fallback, "video"),
     };
 }
 
@@ -289,7 +331,7 @@ export function modelOptionLabel(config: AiConfig, value: string) {
 }
 
 export function modelOptionsFromChannels(channels: ModelChannel[]) {
-    return uniqueModelOptions(channels.flatMap((channel) => channel.models.map((model) => encodeChannelModel(channel.id, model))));
+    return uniqueModelOptions(channels.flatMap((channel) => channelModels(channel).map((model) => encodeChannelModel(channel.id, model))));
 }
 
 export function normalizeModelOptionValue(value: string | undefined, channels: ModelChannel[]) {
@@ -298,28 +340,53 @@ export function normalizeModelOptionValue(value: string | undefined, channels: M
     const decoded = decodeChannelModel(model);
     if (decoded) {
         const channel = channels.find((item) => item.id === decoded.channelId);
-        return channel && channel.models.includes(decoded.model) ? model : "";
+        return channel && channelModels(channel).includes(decoded.model) ? model : "";
     }
-    const channel = channels.find((item) => item.models.includes(decoded?.model || model)) || channels[0];
-    return channel && channel.models.includes(decoded?.model || model) ? encodeChannelModel(channel.id, decoded?.model || model) : model;
+    const rawModel = model;
+    const channel = channels.find((item) => channelModels(item).includes(rawModel)) || channels[0];
+    return channel && channelModels(channel).includes(rawModel) ? encodeChannelModel(channel.id, rawModel) : model;
 }
 
 export function resolveModelChannel(config: AiConfig, value: string) {
     const decoded = decodeChannelModel(value);
     const model = decoded?.model || value;
-    const matched = decoded ? config.channels.find((channel) => channel.id === decoded.channelId) : config.channels.find((channel) => channel.models.includes(model));
+    const matched = decoded ? config.channels.find((channel) => channel.id === decoded.channelId) : config.channels.find((channel) => channelModels(channel).includes(model));
     return matched || config.channels[0] || createModelChannel({ id: "default", name: "默认渠道", baseUrl: config.baseUrl, apiKey: config.apiKey, apiFormat: config.apiFormat, models: config.models.map(modelOptionName) });
 }
 
-export function resolveModelRequestConfig(config: AiConfig, value: string) {
+export function resolveModelRequestConfig(config: AiConfig, value: string, capability?: ModelCapability) {
     const channel = resolveModelChannel(config, value);
+    const endpointKey = endpointKeyForRequest(config, value, capability);
+    const endpoint = endpointKey ? channel.endpoints[endpointKey] : undefined;
     return {
         ...config,
         model: modelOptionName(value || config.model),
-        baseUrl: channel.baseUrl,
-        apiKey: channel.apiKey,
-        apiFormat: channel.apiFormat,
+        baseUrl: endpoint?.baseUrl || channel.baseUrl,
+        apiKey: endpoint?.apiKey || channel.apiKey,
+        apiFormat: endpoint?.apiFormat || channel.apiFormat,
     };
+}
+
+export function channelModels(channel: ModelChannel) {
+    return uniqueRawModels([...(channel.models || []), ...modelEndpointKeys.flatMap((key) => channel.endpoints?.[key]?.models || [])]);
+}
+
+export function endpointKeyForCapability(capability?: ModelCapability): ModelEndpointKey | undefined {
+    if (capability === "image" || capability === "text" || capability === "video") return capability;
+    if (capability === "audio") return "text";
+    return undefined;
+}
+
+function endpointKeyForRequest(config: AiConfig, value: string, capability?: ModelCapability): ModelEndpointKey | undefined {
+    const explicit = endpointKeyForCapability(capability);
+    if (explicit) return explicit;
+    if (config.imageModels.includes(value)) return "image";
+    if (config.videoModels.includes(value)) return "video";
+    if (config.textModels.includes(value) || config.audioModels.includes(value)) return "text";
+    if (isImageModelName(value)) return "image";
+    if (isVideoModelName(value)) return "video";
+    if (isAudioModelName(value) || isTextModelName(value)) return "text";
+    return undefined;
 }
 
 function normalizeChannels(config: AiConfig) {
@@ -329,7 +396,7 @@ function normalizeChannels(config: AiConfig) {
             ...channel,
             id: channel.id || (index === 0 ? "default" : `channel-${index + 1}`),
             name: channel.name || (index === 0 ? "默认渠道" : `渠道 ${index + 1}`),
-            models: uniqueRawModels(channel.models || []),
+            models: uniqueRawModels([...(channel.models || []), ...modelEndpointKeys.flatMap((key) => channel.endpoints?.[key]?.models || [])]),
         }),
     );
     if (!channels.length) {
@@ -351,7 +418,7 @@ function normalizeChannels(config: AiConfig) {
             }),
         );
     }
-    return channels.map((channel) => ({ ...channel, models: uniqueRawModels(channel.models) }));
+    return channels.map((channel) => ({ ...channel, models: channelModels(channel) }));
 }
 
 export function defaultBaseUrlForApiFormat(apiFormat: ApiCallFormat) {
