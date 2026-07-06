@@ -4,6 +4,7 @@ import { ArrowRight } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import { App, Button, Image, Tag } from "antd";
 
+import { PromptCoverImage } from "@/components/prompts/prompt-cover-image";
 import { fetchPrompts, type Prompt } from "@/services/api/prompts";
 import { navigationTools } from "@/constant/navigation-tools";
 import { cn } from "@/lib/utils";
@@ -29,7 +30,7 @@ export default function IndexPage() {
     const [previewOpen, setPreviewOpen] = useState(false);
 
     useEffect(() => {
-        void fetchPrompts({ pageSize: 12 })
+        void fetchPrompts({ pageSize: 12, hasCover: true })
             .then((data) => setPromptShowcase(data.items))
             .catch((error) => message.error(error instanceof Error ? error.message : "获取提示词失败"));
     }, [message]);
@@ -89,7 +90,7 @@ export default function IndexPage() {
                                     index === 3 && "md:col-span-2",
                                 )}
                             >
-                                <img src={item.coverUrl} alt={item.title} className="h-full w-full object-cover transition duration-500 group-hover:scale-[1.03]" />
+                                <PromptCoverImage src={item.coverUrl} title={item.title} className="h-full w-full" imageClassName="transition duration-500 group-hover:scale-[1.03]" />
                                 <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 via-black/35 to-transparent p-4 text-white">
                                     <div className="mb-2 flex flex-wrap gap-1.5">
                                         {item.tags.slice(0, 2).map((tag) => (
@@ -115,7 +116,7 @@ export default function IndexPage() {
                 }}
             >
                 <div className="hidden">
-                    {promptShowcase.map((item) => (
+                    {promptShowcase.filter((item) => item.coverUrl).map((item) => (
                         <Image key={item.id} src={item.coverUrl} alt={item.title} />
                     ))}
                 </div>

@@ -22,7 +22,7 @@ export type PromptListResponse = {
     total: number;
 };
 
-export async function fetchPrompts({ keyword = "", tag = [], category = ALL_PROMPTS_OPTION, page, pageSize }: { keyword?: string; tag?: string[]; category?: string; page?: number; pageSize?: number } = {}) {
+export async function fetchPrompts({ keyword = "", tag = [], category = ALL_PROMPTS_OPTION, page, pageSize, hasCover = false }: { keyword?: string; tag?: string[]; category?: string; page?: number; pageSize?: number; hasCover?: boolean } = {}) {
     const params = serializeApiParams(
         compactApiParams({
             ...(keyword ? { keyword } : {}),
@@ -30,6 +30,7 @@ export async function fetchPrompts({ keyword = "", tag = [], category = ALL_PROM
             ...(category !== ALL_PROMPTS_OPTION ? { category } : {}),
             ...(page ? { page } : {}),
             ...(pageSize ? { pageSize } : {}),
+            ...(hasCover ? { hasCover: 1 } : {}),
         }),
     );
     const response = await fetch(`/api/prompts${params.size ? `?${params}` : ""}`);

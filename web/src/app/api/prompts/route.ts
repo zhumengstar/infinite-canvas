@@ -48,11 +48,12 @@ export async function GET(request: NextRequest) {
     const keyword = (params.get("keyword") || "").trim().toLowerCase();
     const tags = params.getAll("tag").filter(Boolean);
     const category = params.get("category") || "";
+    const hasCover = params.get("hasCover") === "1";
     const page = Math.max(1, Number(params.get("page")) || 1);
     const pageSize = Math.max(1, Math.min(100, Number(params.get("pageSize")) || 20));
     const items = await getPrompts();
     const withoutTagFilter = filterPrompts(items, { keyword, category, tags: [] });
-    const filtered = filterPrompts(items, { keyword, category, tags });
+    const filtered = filterPrompts(items, { keyword, category, tags }).filter((item) => !hasCover || item.coverUrl);
 
     return Response.json({
         items: filtered.slice((page - 1) * pageSize, page * pageSize),
@@ -105,8 +106,8 @@ async function buildGptImage2Prompts() {
     data.forEach((item) => {
         const prompt = cases.get(item.tweet_url || "");
         if (!item.title || !prompt || !item.image_dir) return;
-        const image = `${gptImage2RawBase}/${item.image_dir}/output.jpg`;
-        items.push({ id: `gpt-image-2-prompts-${leftPad(items.length + 1)}`, title: item.title, coverUrl: image, prompt, tags: tagsFromCategory(item.category || ""), preview: markdownPreview([image]), createdAt: item.added_at || "", updatedAt: item.added_at || "" });
+        const image = absoluteImage(gptImage2RawBase, `${item.image_dir}/output.jpg`);
+        items.push({ id: `gpt-image-2-prompts-${leftPad(items.length + 1)}`, title: item.title, coverUrl: proxiedImageUrl(image), prompt, tags: tagsFromCategory(item.category || ""), preview: markdownPreview([image]), createdAt: item.added_at || "", updatedAt: item.added_at || "" });
     });
     return items;
 }
@@ -174,7 +175,7 @@ async function buildDavidWuGptImage2Prompts() {
 }
 
 function defaultPrompt(id: string, title: string, prompt: string, coverUrl: string, tags: string[], preview: string): Omit<Prompt, "category" | "githubUrl"> {
-    return { id, title, coverUrl, prompt, tags, preview, createdAt: "", updatedAt: "" };
+    return { id, title, coverUrl: proxiedImageUrl(coverUrl), prompt, tags, preview, createdAt: "", updatedAt: "" };
 }
 
 async function fetchText(baseUrl: string, file: string) {
@@ -211,8 +212,20 @@ function extractMarkdownImages(baseUrl: string, markdown: string) {
 
 function absoluteImage(baseUrl: string, image: string) {
     if (!image) return "";
-    if (/^https?:\/\//i.test(image)) return image;
-    return `${baseUrl}/${image.replace(/^\.?\//, "")}`;
+    const nextImage = image.trim();
+    if (/^https?:\/\//i.test(nextImage)) return encodeURI(nextImage);
+    return encodeURI(`${baseUrl}/${nextImage.replace(/^\.?\//, "")}`);
+}
+
+function proxiedImageUrl(image: string) {
+    if (!image) return "";
+    try {
+        const url = new URL(image);
+        if (url.hostname === "pbs.twimg.com") return image;
+    } catch {
+        return image;
+    }
+    return `/api/prompts/image?url=${encodeURIComponent(image)}`;
 }
 
 function tagsFromCategory(category: string) {
