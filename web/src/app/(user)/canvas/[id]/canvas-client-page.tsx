@@ -3208,8 +3208,15 @@ async function hydrateCanvasImages(nodes: CanvasNodeData[]) {
         nodes.map(async (node) => {
             const content = node.metadata?.content;
             if ((node.type === CanvasNodeType.Video || node.type === CanvasNodeType.Audio) && node.metadata?.storageKey) return { ...node, metadata: { ...node.metadata, content: await resolveMediaUrl(node.metadata.storageKey, content) } };
-            if (node.type !== CanvasNodeType.Image || !content) return node;
-            if (node.metadata?.storageKey) return { ...node, metadata: { ...node.metadata, content: await resolveImageUrl(node.metadata.storageKey, content) } };
+            if (node.type !== CanvasNodeType.Image) return node;
+            if (node.metadata?.storageKey) {
+                const resolved = await resolveImageUrl(node.metadata.storageKey, "");
+                if (resolved) return { ...node, metadata: { ...node.metadata, content: resolved, errorDetails: undefined } };
+                if (content?.startsWith("data:image/")) return { ...node, metadata: { ...node.metadata, ...imageMetadata(await uploadImage(content)), errorDetails: undefined } };
+                if (node.metadata.serverImageJobId && node.metadata.status === NODE_STATUS_LOADING) return { ...node, metadata: { ...node.metadata, content: undefined } };
+                return { ...node, metadata: { ...node.metadata, content: undefined, status: NODE_STATUS_ERROR, errorDetails: "本地图片缓存缺失，请重新生成或重新导入图片" } };
+            }
+            if (!content) return node;
             if (!content.startsWith("data:image/")) return node;
             return { ...node, metadata: { ...node.metadata, ...imageMetadata(await uploadImage(content)) } };
         }),
