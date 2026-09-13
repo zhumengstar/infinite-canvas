@@ -73,7 +73,15 @@ type ResponseStreamState = { buffer: string; text: string; payload?: ResponseApi
 
 type ImageApiResponse = {
     data?: Array<Record<string, unknown>>;
+    images?: Array<Record<string, unknown> | string>;
+    results?: Array<Record<string, unknown> | string>;
+    output?: Array<string> | string;
+    image?: string;
+    url?: string;
+    candidates?: Array<{ content?: { parts?: GeminiPart[] }; finishReason?: string }>;
+    choices?: Array<{ message?: { content?: string }; text?: string }>;
     error?: { message?: string };
+    promptFeedback?: { blockReason?: string };
     code?: number;
     msg?: string;
 };
@@ -274,12 +282,120 @@ function supportsGeminiImageSize(model: string) {
     return value.includes("gemini-3") || value.includes("3.1") || value.includes("3-pro");
 }
 
-function resolveImageSource(item: Record<string, unknown>) {
-    if (typeof item.b64_json === "string" && item.b64_json) {
-        return `data:image/png;base64,${item.b64_json}`;
+function extractImageFromString(str: string): string | null {
+    if (!str || typeof str !== "string") return null;
+    const trimmed = str.trim();
+    if (trimmed.startsWith("data:image/")) {
+        return trimmed;
     }
-    if (typeof item.url === "string" && item.url) {
-        return item.url;
+    // Markdown image syntax: ![alt](url_or_base64)
+    const mdMatch = trimmed.match(/!\[.*?\]\((https?:\/\/[^\s)]+|data:image\/[^\s)]+)\)/);
+    if (mdMatch) {
+        return mdMatch[1];
+    }
+    // Pure HTTP/HTTPS URL
+    if (/^https?:\/\/[^\s]+$/.test(trimmed)) {
+        return trimmed;
+    }
+    // Raw Base64 string without data prefix
+    if (trimmed.length > 200 && /^[A-Za-z0-9+/=]+$/.test(trimmed)) {
+        return `data:image/png;base64,${trimmed}`;
+    }
+    return null;
+}
+
+function resolveImageSource(item: unknown): string | null {
+    if (!item) return null;
+    if (typeof item === "string") {
+        return extractImageFromString(item);
+    }
+    if (typeof item !== "object") return null;
+    const obj = item as Record<string, unknown>;
+
+    // OpenAI standard b64_json
+    if (typeof obj.b64_json === "string" && obj.b64_json) {
+        return obj.b64_json.startsWith("data:image/") ? obj.b64_json : `data:image/png;base64,${obj.b64_json}`;
+    }
+    // Common variants: base64
+    if (typeof obj.base64 === "string" && obj.base64) {
+        return obj.base64.startsWith("data:image/") ? obj.base64 : `data:image/png;base64,${obj.base64}`;
+    }
+    // OpenAI standard url
+    if (typeof obj.url === "string" && obj.url) {
+        return obj.url;
+    }
+    // Common variants: image
+    if (typeof obj.image === "string" && obj.image) {
+        return extractImageFromString(obj.image);
+    }
+    // Common variants: image_url { url: "..." } or string
+    if (typeof obj.image_url === "string" && obj.image_url) {
+        return obj.image_url;
+    }
+    if (obj.image_url && typeof obj.image_url === "object") {
+        const nestedUrl = (obj.image_url as Record<string, unknown>).url;
+        if (typeof nestedUrl === "string" && nestedUrl) return nestedUrl;
+    }
+    return null;
+}
+
+function extractGeminiImages(payload: Record<string, unknown>): string[] {
+    const images: string[] = [];
+    const candidates = payload.candidates;
+    if (!Array.isArray(candidates)) return images;
+
+    for (const candidate of candidates) {
+        if (!candidate || typeof candidate !== "object") continue;
+        const candidateObj = candidate as Record<string, unknown>;
+        const parts = candidateObj.content && typeof candidateObj.content === "object"
+            ? (candidateObj.content as Record<string, unknown>).parts
+            : undefined;
+        if (!Array.isArray(parts)) continue;
+
+        for (const part of parts) {
+            if (!part || typeof part !== "object") continue;
+            const p = part as Record<string, unknown>;
+            // Case 1: inlineData or inline_data
+            const inline = (p.inlineData || p.inline_data) as Record<string, unknown> | undefined;
+            if (inline && typeof inline.data === "string" && inline.data) {
+                const mime = (inline.mimeType || inline.mime_type || "image/png") as string;
+                images.push(`data:${mime};base64,${inline.data}`);
+                continue;
+            }
+            // Case 2: fileData or file_data
+            const fileData = (p.fileData || p.file_data) as Record<string, unknown> | undefined;
+            const fileUri = fileData?.fileUri || fileData?.file_uri;
+            if (typeof fileUri === "string" && fileUri) {
+                images.push(fileUri);
+                continue;
+            }
+            // Case 3: text part containing markdown image or URL or data URL
+            if (typeof p.text === "string" && p.text) {
+                const extracted = extractImageFromString(p.text);
+                if (extracted) {
+                    images.push(extracted);
+                }
+            }
+        }
+    }
+    return images;
+}
+
+function checkGeminiBlockReason(payload: Record<string, unknown>): string | null {
+    if (payload.promptFeedback && typeof payload.promptFeedback === "object") {
+        const feedback = payload.promptFeedback as Record<string, unknown>;
+        if (feedback.blockReason && feedback.blockReason !== "BLOCK_REASON_UNSPECIFIED") {
+            return apiText("geminiPromptBlocked", { reason: String(feedback.blockReason) });
+        }
+    }
+    if (Array.isArray(payload.candidates) && payload.candidates.length > 0) {
+        const first = payload.candidates[0];
+        if (first && typeof first === "object") {
+            const finishReason = (first as Record<string, unknown>).finishReason;
+            if (finishReason && finishReason !== "STOP" && finishReason !== "FINISH_REASON_UNSPECIFIED") {
+                return apiText("geminiGenerationBlocked", { reason: String(finishReason) });
+            }
+        }
     }
     return null;
 }
@@ -288,15 +404,56 @@ function parseImagePayload(payload: ImageApiResponse) {
     if (typeof payload.code === "number" && payload.code !== 0) {
         throw new Error(payload.msg || apiText("requestFailed"));
     }
-    // Support data, images, and results response fields used by different APIs.
-    const imageList = payload.data
-        || (payload as Record<string, unknown>).images as Array<Record<string, unknown>> | undefined
-        || (payload as Record<string, unknown>).results as Array<Record<string, unknown>> | undefined
-        || [];
-    const images = imageList
+    const rawObj = payload as Record<string, unknown>;
+
+    // 1. Support OpenAI standard & common list variants: data, images, results, output
+    let candidateList: unknown[] = [];
+    if (Array.isArray(rawObj.data)) {
+        candidateList = rawObj.data;
+    } else if (Array.isArray(rawObj.images)) {
+        candidateList = rawObj.images;
+    } else if (Array.isArray(rawObj.results)) {
+        candidateList = rawObj.results;
+    } else if (Array.isArray(rawObj.output)) {
+        candidateList = rawObj.output;
+    } else if (typeof rawObj.output === "string" && rawObj.output) {
+        candidateList = [rawObj.output];
+    } else if (typeof rawObj.image === "string" && rawObj.image) {
+        candidateList = [rawObj.image];
+    } else if (typeof rawObj.url === "string" && rawObj.url) {
+        candidateList = [rawObj.url];
+    }
+
+    let resolvedList = candidateList
         .map(resolveImageSource)
-        .filter((value): value is string => Boolean(value))
-        .map((dataUrl) => ({ id: nanoid(), dataUrl }));
+        .filter((value): value is string => Boolean(value));
+
+    // 2. Support Gemini native format: candidates -> content.parts -> inlineData / fileData / text
+    if (resolvedList.length === 0 && Array.isArray(rawObj.candidates)) {
+        const geminiImages = extractGeminiImages(rawObj);
+        if (geminiImages.length > 0) {
+            resolvedList = geminiImages;
+        } else {
+            // Check if Gemini blocked the prompt or generation due to safety policy
+            const blockedReason = checkGeminiBlockReason(rawObj);
+            if (blockedReason) {
+                throw new Error(blockedReason);
+            }
+        }
+    }
+
+    // 3. Support choices format (chat completions endpoint wrapper)
+    if (resolvedList.length === 0 && Array.isArray(rawObj.choices)) {
+        for (const choice of rawObj.choices as Array<Record<string, unknown>>) {
+            const content = (choice?.message as Record<string, unknown>)?.content || choice?.text;
+            if (typeof content === "string" && content) {
+                const extracted = extractImageFromString(content);
+                if (extracted) resolvedList.push(extracted);
+            }
+        }
+    }
+
+    const images = resolvedList.map((dataUrl) => ({ id: nanoid(), dataUrl }));
 
     if (images.length === 0) {
         // Check whether the response contains data in an unrecognized format.
@@ -741,16 +898,8 @@ async function requestGeminiImagesOnce(config: AiConfig, prompt: string, referen
 
 function parseGeminiImagePayload(payload: GeminiPayload) {
     validateGeminiPayload(payload);
-    const images =
-        payload.candidates
-            ?.flatMap((candidate) => candidate.content?.parts || [])
-            .map((part) => {
-                const inlineData = part.inlineData || (part.inline_data ? { mimeType: part.inline_data.mimeType || part.inline_data.mime_type, data: part.inline_data.data } : undefined);
-                if (inlineData?.data) return `data:${inlineData.mimeType || "image/png"};base64,${inlineData.data}`;
-                return part.fileData?.fileUri || null;
-            })
-            .filter((value): value is string => Boolean(value))
-            .map((dataUrl) => ({ id: nanoid(), dataUrl })) || [];
+    const extracted = extractGeminiImages(payload as Record<string, unknown>);
+    const images = extracted.map((dataUrl) => ({ id: nanoid(), dataUrl }));
     if (!images.length) throw new Error(apiText("geminiNoImage"));
     return images;
 }
