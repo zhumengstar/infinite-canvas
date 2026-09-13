@@ -3,7 +3,8 @@ import { ListPlus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { defaultBaseUrlForApiFormat, guessCapability, normalizeChannelModels, type ApiCallFormat, type ChannelModel, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import { defaultBaseUrlForApiFormat, guessApiFormat,
+    guessCapability, normalizeChannelModels, type ApiCallFormat, type ChannelModel, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 import { ModelScriptEditor } from "./model-script-editor";
 import { ModelSelectModal } from "./model-select-modal";
 
@@ -36,7 +37,9 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
 
     const applySelection = (names: string[]) => {
         const map = new Map(draft.models.map((model) => [model.name, model]));
-        setModels(names.map((name) => map.get(name) || { name, capability: guessCapability(name) }));
+        const newModels = names.map((name) => map.get(name) || { name, capability: guessCapability(name) });
+        const autoFormat = guessApiFormat(newModels, draft.baseUrl);
+        patch({ models: newModels, apiFormat: autoFormat });
     };
 
     const setCapability = (name: string, capability: ModelCapability) => setModels(draft.models.map((model) => (model.name === name ? { ...model, capability } : model)));
@@ -70,7 +73,20 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
                     <Input value={draft.name} onChange={(event) => patch({ name: event.target.value })} />
                 </label>
                 <label className="block">
-                    <span className="mb-1 block text-sm font-medium">{t("config.channelEditor.protocol")}</span>
+                    <div className="mb-1 flex items-center justify-between">
+                        <span className="text-sm font-medium">{t("config.channelEditor.protocol")}</span>
+                        <Button
+                            type="link"
+                            size="small"
+                            className="p-0 text-xs h-auto text-blue-500 hover:text-blue-600"
+                            onClick={() => {
+                                const detected = guessApiFormat(draft.models, draft.baseUrl);
+                                changeApiFormat(detected);
+                            }}
+                        >
+                            自动识别
+                        </Button>
+                    </div>
                     <Select className="w-full" value={draft.apiFormat} options={apiFormatOptions} onChange={changeApiFormat} />
                 </label>
                 <label className="block md:col-span-2">

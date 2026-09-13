@@ -163,6 +163,23 @@ export function guessCapability(name: string): ModelCapability {
     return "text";
 }
 
+export function guessApiFormat(models?: Array<string | ChannelModel>, baseUrl?: string): ApiCallFormat {
+    const url = (baseUrl || "").toLowerCase();
+    if (url.includes("generativelanguage.googleapis.com") || url.includes("gemini")) {
+        return "gemini";
+    }
+    if (!models || models.length === 0) {
+        return "openai";
+    }
+    const names = models.map((m) => (typeof m === "string" ? m : m.name).toLowerCase());
+    const isGemini = (n: string) => n.includes("gemini") || n.startsWith("imagen");
+    const geminiCount = names.filter(isGemini).length;
+    if (geminiCount > 0 && geminiCount >= names.length / 2) {
+        return "gemini";
+    }
+    return "openai";
+}
+
 function findChannelModel(config: AiConfig, value: string): { channel: ModelChannel; model: ChannelModel } | null {
     const decoded = decodeChannelModel(value);
     const name = decoded?.model || value;
@@ -426,12 +443,17 @@ export function resolveModelChannel(config: AiConfig, value: string) {
 
 export function resolveModelRequestConfig(config: AiConfig, value: string) {
     const channel = resolveModelChannel(config, value);
+    const model = modelOptionName(value || config.model);
+    let apiFormat = channel.apiFormat;
+    if (apiFormat === "openai" && (model.toLowerCase().includes("gemini") || model.toLowerCase().startsWith("imagen"))) {
+        apiFormat = "gemini";
+    }
     return {
         ...config,
-        model: modelOptionName(value || config.model),
+        model,
         baseUrl: channel.baseUrl,
         apiKey: channel.apiKey,
-        apiFormat: channel.apiFormat,
+        apiFormat,
     };
 }
 

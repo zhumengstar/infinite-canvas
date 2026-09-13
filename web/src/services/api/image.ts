@@ -201,14 +201,48 @@ function resolveRequestSize(quality: string | undefined, size: string) {
     throw new Error(apiText("invalidImageSizeFormat"));
 }
 
+export function buildResolutionPromptEnhancement(config: AiConfig): string {
+    const size = (config.size || "").trim();
+    const quality = (config.quality || "").trim().toLowerCase();
+    const parts: string[] = [];
+
+    const dimensions = parseImageDimensions(size);
+    if (dimensions) {
+        const is4k = dimensions.width >= 3000 || dimensions.height >= 3000;
+        const is2k = !is4k && (dimensions.width >= 1800 || dimensions.height >= 1800);
+        if (is4k || quality === "high" || quality === "4k") {
+            parts.push("4K UHD resolution, 3840x2160 pixels, highly detailed, ultra-high definition");
+        } else if (is2k || quality === "medium" || quality === "2k" || quality === "hd") {
+            parts.push("2K high resolution, detailed");
+        }
+
+        try {
+            const ratio = closestGeminiAspectRatio(`${dimensions.width}:${dimensions.height}`);
+            if (ratio) {
+                parts.push(`aspect ratio ${ratio}`);
+            }
+        } catch {
+            // Ignore ratio error
+        }
+    } else if (size && size !== "auto") {
+        if (size.includes(":")) {
+            parts.push(`aspect ratio ${size}`);
+        }
+        if (quality === "high" || quality === "4k") {
+            parts.push("4K UHD, high resolution");
+        }
+    } else if (quality === "high" || quality === "4k") {
+        parts.push("4K UHD, ultra-detailed");
+    }
+
+    if (parts.length === 0) return "";
+    return ` [Image specification: ${parts.join(", ")}]`;
+}
+
 function resolveGeminiImageConfig(config: AiConfig) {
-    const value = config.size.trim();
-    const dimensions = parseImageDimensions(value);
-    const ratio = dimensions ? `${dimensions.width}:${dimensions.height}` : value;
-    const aspectRatio = value && value.toLowerCase() !== "auto" ? closestGeminiAspectRatio(ratio) : undefined;
-    const imageSize = supportsGeminiImageSize(config.model) ? resolveGeminiImageSize(config.quality, dimensions) : undefined;
-    const image = { ...(aspectRatio ? { aspectRatio } : {}), ...(imageSize ? { imageSize } : {}) };
-    return Object.keys(image).length ? { imageConfig: image } : {};
+    // Note: Do not send unrecognized responseFormat.image or imageConfig to Google Gemini API
+    // as it triggers HTTP 400 Bad Request on official endpoints.
+    return {};
 }
 
 function closestGeminiAspectRatio(value: string) {
@@ -689,14 +723,15 @@ async function requestGeminiImages(config: AiConfig, prompt: string, references:
 }
 
 async function requestGeminiImagesOnce(config: AiConfig, prompt: string, references: ReferenceImage[], options?: RequestOptions) {
-    const parts: GeminiPart[] = [{ text: prompt }];
+    const effectivePrompt = `${prompt}${buildResolutionPromptEnhancement(config)}`;
+    const parts: GeminiPart[] = [{ text: effectivePrompt }];
     for (const image of references) {
         parts.push(toGeminiImagePart(await imageToDataUrl(image)));
     }
     const response = await axios.post<GeminiPayload>(
         geminiApiUrl(config, "generateContent"),
         {
-            ...toGeminiBody(config, [{ role: "user", content: prompt }], { generationConfig: { responseModalities: ["TEXT", "IMAGE"], ...resolveGeminiImageConfig(config) } }),
+            ...toGeminiBody(config, [{ role: "user", content: effectivePrompt }], { generationConfig: { responseModalities: ["TEXT", "IMAGE"], ...resolveGeminiImageConfig(config) } }),
             contents: [{ role: "user", parts }],
         },
         { headers: geminiHeaders(config), signal: options?.signal },
@@ -753,12 +788,13 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
     const quality = normalizeQuality(config.quality);
     const requestSize = resolveRequestSize(quality, config.size);
     const background = normalizeBackground(config.background);
+    const enhancedPrompt = `${prompt}${buildResolutionPromptEnhancement(requestConfig)}`;
     try {
         const response = await axios.post<ImageApiResponse>(
             aiApiUrl(requestConfig, "/images/generations"),
             {
                 model: requestConfig.model,
-                prompt: withSystemPrompt(requestConfig, prompt),
+                prompt: withSystemPrompt(requestConfig, enhancedPrompt),
                 n,
                 ...(quality ? { quality } : {}),
                 ...(requestSize ? { size: requestSize } : {}),

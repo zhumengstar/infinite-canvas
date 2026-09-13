@@ -1,7 +1,6 @@
 import { ArrowLeft, ArrowRight, BookOpen, CheckSquare, ClipboardPaste, Download, FolderPlus, History, ImagePlus, LoaderCircle, PenLine, Plus, SlidersHorizontal, Sparkles, Trash2, Upload } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { App, Button, Checkbox, Drawer, Empty, Image, Input, Modal, Tag, Tooltip, Typography } from "antd";
-import localforage from "localforage";
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
@@ -15,58 +14,20 @@ import { modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } f
 import { useThemeStore } from "@/stores/use-theme-store";
 import { nanoid } from "nanoid";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
-import { requestEdit, requestGeneration } from "@/services/api/image";
-import { deleteStoredImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
+import { uploadImage } from "@/services/image-storage";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import type { ReferenceImage } from "@/types/image";
-import i18n from "@/i18n";
-
-type GeneratedImage = {
-    id: string;
-    dataUrl: string;
-    storageKey?: string;
-    durationMs: number;
-    width: number;
-    height: number;
-    bytes: number;
-    mimeType?: string;
-};
-
-type GenerationResult = {
-    id: string;
-    status: "pending" | "success" | "failed";
-    image?: GeneratedImage;
-    error?: string;
-};
-
-type GenerationLog = {
-    id: string;
-    createdAt: number;
-    title: string;
-    prompt: string;
-    time: string;
-    model: string;
-    config: GenerationLogConfig;
-    references: ReferenceImage[];
-    durationMs: number;
-    successCount: number;
-    failCount: number;
-    imageCount: number;
-    size: string;
-    quality: string;
-    status: "success" | "failed";
-    images: GeneratedImage[];
-    thumbnails: string[];
-};
-
-type GenerationLogConfig = Pick<AiConfig, "model" | "imageModel" | "quality" | "size" | "count">;
+import {
+    useImageWorkbenchStore,
+    type GeneratedImage,
+    type GenerationLog,
+    type ImageRequestSnapshot,
+} from "@/stores/use-image-workbench-store";
 
 type UpdateAiConfig = <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
 
-const LOG_STORE_KEY = "infinite-canvas:image_generation_logs";
 const RESULT_ACTION_BUTTON_CLASS = "min-w-0 px-1.5 [&_.ant-btn-icon]:shrink-0 [&>span:last-child]:min-w-0 [&>span:last-child]:truncate";
-const logStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_generation_logs" });
 
 export default function ImagePage() {
     const { message } = App.useApp();
@@ -79,22 +40,35 @@ export default function ImagePage() {
     const isAiConfigReady = useConfigStore((state) => state.isAiConfigReady);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAsset = useAssetStore((state) => state.addAsset);
-    const [prompt, setPrompt] = useState("");
-    const [references, setReferences] = useState<ReferenceImage[]>([]);
-    const [results, setResults] = useState<GenerationResult[]>([]);
-    const [logs, setLogs] = useState<GenerationLog[]>([]);
-    const [running, setRunning] = useState(false);
+
+    // Global workbench state persisted across route changes and reloads
+    const prompt = useImageWorkbenchStore((state) => state.prompt);
+    const setPrompt = useImageWorkbenchStore((state) => state.setPrompt);
+    const references = useImageWorkbenchStore((state) => state.references);
+    const setReferences = useImageWorkbenchStore((state) => state.setReferences);
+    const results = useImageWorkbenchStore((state) => state.results);
+    const logs = useImageWorkbenchStore((state) => state.logs);
+    const running = useImageWorkbenchStore((state) => state.running);
+    const elapsedMs = useImageWorkbenchStore((state) => state.elapsedMs);
+    const selectedLogIds = useImageWorkbenchStore((state) => state.selectedLogIds);
+    const setSelectedLogIds = useImageWorkbenchStore((state) => state.setSelectedLogIds);
+    const previewLog = useImageWorkbenchStore((state) => state.previewLog);
+    const previewGenerationLog = useImageWorkbenchStore((state) => state.previewGenerationLog);
+    const createSession = useImageWorkbenchStore((state) => state.createSession);
+    const refreshLogs = useImageWorkbenchStore((state) => state.refreshLogs);
+    const deleteSelectedLogs = useImageWorkbenchStore((state) => state.deleteSelectedLogs);
+    const startGeneration = useImageWorkbenchStore((state) => state.startGeneration);
+    const retryResult = useImageWorkbenchStore((state) => state.retryResult);
+
+    // Local UI modal states
     const [logsOpen, setLogsOpen] = useState(false);
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [promptDialogOpen, setPromptDialogOpen] = useState(false);
     const [assetPickerOpen, setAssetPickerOpen] = useState(false);
-    const [startedAt, setStartedAt] = useState(0);
-    const [elapsedMs, setElapsedMs] = useState(0);
-    const [selectedLogIds, setSelectedLogIds] = useState<string[]>([]);
-    const [previewLog, setPreviewLog] = useState<GenerationLog | null>(null);
     const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
     const [isReferenceDragActive, setIsReferenceDragActive] = useState(false);
     const [autoRunToken, setAutoRunToken] = useState(0);
+
     const imageCommand = useWorkbenchAgentStore((state) => state.imageCommand);
     const clearImageCommand = useWorkbenchAgentStore((state) => state.clearImageCommand);
     const updateAgentTask = useWorkbenchAgentStore((state) => state.updateTask);
@@ -105,15 +79,10 @@ export default function ImagePage() {
     const canGenerate = Boolean(prompt.trim());
     const generationCount = Math.max(1, Math.min(10, Number(config.count) || 1));
 
-    useEffect(() => {
-        if (!running || !startedAt) return;
-        const timer = window.setInterval(() => setElapsedMs(performance.now() - startedAt), 1000);
-        return () => window.clearInterval(timer);
-    }, [running, startedAt]);
-
+    // Refresh logs on mount and automatically preview latest log if results are empty
     useEffect(() => {
         void refreshLogs();
-    }, []);
+    }, [refreshLogs]);
 
     const addReferences = async (files?: FileList | null) => {
         const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
@@ -147,6 +116,20 @@ export default function ImagePage() {
         }
     };
 
+    const buildRequestSnapshot = (): ImageRequestSnapshot | null => {
+        const text = prompt.trim();
+        if (!text) {
+            message.error(t("imageWorkbench.promptRequired"));
+            return null;
+        }
+        if (!isAiConfigReady(effectiveConfig, model)) {
+            message.warning(t("workbench.configFirst"));
+            openConfigDialog(true);
+            return null;
+        }
+        return { text, config: { ...effectiveConfig, model, count: "1" }, references: [...references] };
+    };
+
     const generate = async () => {
         const agentTaskId = agentTaskIdRef.current;
         agentTaskIdRef.current = undefined;
@@ -163,51 +146,20 @@ export default function ImagePage() {
             return;
         }
 
-        const snapshot = buildRequestSnapshot();
-        if (!snapshot) {
-            if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: t("imageWorkbench.invalidParams") });
-            return;
-        }
-
-        setElapsedMs(0);
-        setRunning(true);
-        if (agentTaskId) updateAgentTask(agentTaskId, { status: "running", error: undefined });
-        setPreviewLog(null);
-        setResults(Array.from({ length: generationCount }, () => ({ id: nanoid(), status: "pending" })));
-        const batchStartedAt = performance.now();
-        setStartedAt(batchStartedAt);
-
-        const tasks = Array.from({ length: generationCount }, (_, index) => runGenerationSlot(index, snapshot));
-
-        const result = await Promise.allSettled(tasks);
-        const successImages = result.filter((item): item is PromiseFulfilledResult<GeneratedImage> => item.status === "fulfilled").map((item) => item.value);
-        const successCount = successImages.length;
-        const failCount = generationCount - successCount;
-        const failed = result.find((item): item is PromiseRejectedResult => item.status === "rejected");
-        const error = failed?.reason instanceof Error ? failed.reason.message : failCount ? t("workbench.generationFailed") : undefined;
-        if (agentTaskId) updateAgentTask(agentTaskId, { status: successCount ? "succeeded" : "failed", successCount, failCount, error: successCount ? undefined : error });
-
-        try {
-            saveLog(
-                buildLog({
-                    prompt: text,
-                    model,
-                    config: { ...snapshot.config, count: String(generationCount) },
-                    references: snapshot.references,
-                    durationMs: performance.now() - batchStartedAt,
-                    successCount,
-                    failCount,
-                    status: successCount ? "success" : "failed",
-                    images: successImages,
-                }),
-            );
-            successCount ? message.success(t("imageWorkbench.generated")) : message.error(failed?.reason instanceof Error ? failed.reason.message : t("workbench.generationFailed"));
-        } finally {
-            setRunning(false);
-        }
+        await startGeneration({
+            prompt: text,
+            references,
+            config: effectiveConfig,
+            model,
+            generationCount,
+            agentTaskId,
+            onSuccessMessage: (msg) => message.success(msg),
+            onErrorMessage: (msg) => message.error(msg),
+            updateAgentTask,
+        });
     };
 
-    // Handle image-generation commands from the Agent panel by setting the prompt and optionally starting generation.
+    // Handle image-generation commands from the Agent panel
     useEffect(() => {
         if (!imageCommand || imageCommand.nonce === processedCommandRef.current) return;
         processedCommandRef.current = imageCommand.nonce;
@@ -221,7 +173,7 @@ export default function ImagePage() {
             agentTaskIdRef.current = imageCommand.taskId;
             setAutoRunToken((value) => value + 1);
         }
-    }, [imageCommand, clearImageCommand, running, updateAgentTask]);
+    }, [imageCommand, clearImageCommand, running, updateAgentTask, setPrompt, t]);
 
     useEffect(() => {
         if (!autoRunToken) return;
@@ -265,100 +217,15 @@ export default function ImagePage() {
         setAssetPickerOpen(false);
     };
 
-    const createSession = () => {
-        setPrompt("");
-        setReferences([]);
-        setResults([]);
-        setElapsedMs(0);
-        setStartedAt(0);
-        setSelectedLogIds([]);
-        setPreviewLog(null);
-    };
-
-    const deleteSelectedLogs = () => {
-        const imageKeys = logs.filter((log) => selectedLogIds.includes(log.id)).flatMap((log) => log.images.map((image) => image.storageKey).filter((key): key is string => Boolean(key)));
-        void Promise.all([deleteStoredImages(imageKeys), ...selectedLogIds.map((id) => logStore.removeItem(id))]).then(refreshLogs);
-        if (previewLog && selectedLogIds.includes(previewLog.id)) {
-            setPreviewLog(null);
-            setResults([]);
-        }
-        setSelectedLogIds([]);
-        setDeleteConfirmOpen(false);
-    };
-
-    const saveLog = (log: GenerationLog) => {
-        void logStore.setItem(log.id, serializeLog(log)).then(refreshLogs);
-    };
-
-    const refreshLogs = async () => setLogs(await readStoredLogs());
-
-    const previewGenerationLog = async (log: GenerationLog) => {
-        setPreviewLog(log);
-        setLogsOpen(false);
-        setPrompt(log.prompt);
-        setReferences(log.references || []);
-        if (log.config.imageModel || log.model) updateConfig("imageModel", log.config.imageModel || log.model);
-        if (log.config.quality) updateConfig("quality", log.config.quality);
-        if (log.config.size) updateConfig("size", log.config.size);
-        if (log.config.count) updateConfig("count", log.config.count);
-        setResults(log.images.map((image) => ({ id: image.id, status: "success", image })));
-    };
-
-    const buildRequestSnapshot = () => {
-        const text = prompt.trim();
-        if (!text) {
-            message.error(t("imageWorkbench.promptRequired"));
-            return null;
-        }
-        if (!isAiConfigReady(effectiveConfig, model)) {
-            message.warning(t("workbench.configFirst"));
-            openConfigDialog(true);
-            return null;
-        }
-        return { text, config: { ...effectiveConfig, model, count: "1" }, references: [...references] };
-    };
-
-    const runGenerationSlot = async (index: number, snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }) => {
-        const itemStartedAt = performance.now();
-        try {
-            const result = snapshot.references.length ? await requestEdit(snapshot.config, snapshot.text, snapshot.references) : await requestGeneration(snapshot.config, snapshot.text);
-            const image = result[0];
-            if (!image) throw new Error(t("imageWorkbench.missingResult"));
-            const stored = await uploadImage(image.dataUrl);
-            const nextImage: GeneratedImage = { id: image.id, dataUrl: stored.url, ...(stored.storageKey ? { storageKey: stored.storageKey } : {}), durationMs: performance.now() - itemStartedAt, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType };
-            setResults((value) => updateResultAt(value, index, { status: "success", image: nextImage }));
-            return nextImage;
-        } catch (error) {
-            setResults((value) => updateResultAt(value, index, { status: "failed", error: error instanceof Error ? error.message : t("workbench.generationFailed") }));
-            throw error;
-        }
-    };
-
-    const retryResult = async (index: number) => {
+    const handleRetry = async (index: number) => {
         const snapshot = buildRequestSnapshot();
         if (!snapshot) return;
-        setPreviewLog(null);
-        setResults((value) => updateResultAt(value, index, { status: "pending", error: undefined, image: undefined }));
-        const retryStartedAt = performance.now();
-        try {
-            const image = await runGenerationSlot(index, snapshot);
-            saveLog(
-                buildLog({
-                    prompt: snapshot.text,
-                    model,
-                    config: { ...snapshot.config, count: "1" },
-                    references: snapshot.references,
-                    durationMs: performance.now() - retryStartedAt,
-                    successCount: 1,
-                    failCount: 0,
-                    status: "success",
-                    images: [image],
-                }),
-            );
-            message.success(t("workbench.retrySuccess"));
-        } catch {
-            // runGenerationSlot has already marked the result as failed.
-        }
+        await retryResult(index, snapshot);
+    };
+
+    const handleDeleteSelected = async () => {
+        await deleteSelectedLogs();
+        setDeleteConfirmOpen(false);
     };
 
     return (
@@ -425,45 +292,45 @@ export default function ImagePage() {
                                 <div
                                     className={`hover-scrollbar hover-scrollbar-hint relative flex min-h-24 w-full min-w-0 max-w-full gap-2 overflow-x-scroll overflow-y-hidden rounded-lg border border-dashed p-2 pb-3 overscroll-x-contain transition-colors ${isReferenceDragActive ? "border-stone-900 bg-stone-100/80 dark:border-stone-100 dark:bg-stone-900/80" : "border-stone-300 dark:border-stone-700"}`}
                                     onDragEnter={(event) => {
-                                        event.preventDefault();
-                                        dragDepthRef.current += 1;
-                                        if (event.dataTransfer.types.includes("Files")) setIsReferenceDragActive(true);
+                                         event.preventDefault();
+                                         dragDepthRef.current += 1;
+                                         if (event.dataTransfer.types.includes("Files")) setIsReferenceDragActive(true);
                                     }}
                                     onDragOver={(event) => {
-                                        event.preventDefault();
-                                        event.dataTransfer.dropEffect = "copy";
+                                         event.preventDefault();
+                                         event.dataTransfer.dropEffect = "copy";
                                     }}
                                     onDragLeave={(event) => {
-                                        event.preventDefault();
-                                        dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
-                                        if (!dragDepthRef.current) setIsReferenceDragActive(false);
+                                         event.preventDefault();
+                                         dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+                                         if (!dragDepthRef.current) setIsReferenceDragActive(false);
                                     }}
                                     onDrop={(event) => {
-                                        event.preventDefault();
-                                        dragDepthRef.current = 0;
-                                        setIsReferenceDragActive(false);
-                                        void addReferences(event.dataTransfer.files);
+                                         event.preventDefault();
+                                         dragDepthRef.current = 0;
+                                         setIsReferenceDragActive(false);
+                                         void addReferences(event.dataTransfer.files);
                                     }}
                                     onWheel={(event) => {
-                                        if (event.currentTarget.scrollWidth <= event.currentTarget.clientWidth) return;
-                                        event.preventDefault();
-                                        event.currentTarget.scrollLeft += event.deltaY;
+                                         if (event.currentTarget.scrollWidth <= event.currentTarget.clientWidth) return;
+                                         event.preventDefault();
+                                         event.currentTarget.scrollLeft += event.deltaY;
                                     }}
                                 >
                                     {references.map((item, index) => (
-                                        <div key={item.id} className="group relative size-20 shrink-0 overflow-hidden rounded-md border border-stone-200 dark:border-stone-800">
-                                            <img src={item.dataUrl} alt={item.name} className="size-full object-cover" />
-                                            <span className="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">{imageReferenceLabel(index)}</span>
-                                            <ReferenceOrderButtons index={index} total={references.length} onMove={(offset) => setReferences((value) => moveListItem(value, index, offset))} />
-                                            <button
-                                                type="button"
-                                                className="absolute right-1 top-1 hidden size-6 items-center justify-center rounded bg-black/60 text-white group-hover:flex"
-                                                onClick={() => setReferences((value) => value.filter((ref) => ref.id !== item.id))}
-                                                aria-label={t("imageWorkbench.removeReference")}
-                                            >
-                                                <Trash2 className="size-3.5" />
-                                            </button>
-                                        </div>
+                                         <div key={item.id} className="group relative size-20 shrink-0 overflow-hidden rounded-md border border-stone-200 dark:border-stone-800">
+                                             <img src={item.dataUrl} alt={item.name} className="size-full object-cover" />
+                                             <span className="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">{imageReferenceLabel(index)}</span>
+                                             <ReferenceOrderButtons index={index} total={references.length} onMove={(offset) => setReferences((value) => moveListItem(value, index, offset))} />
+                                             <button
+                                                 type="button"
+                                                 className="absolute right-1 top-1 hidden size-6 items-center justify-center rounded bg-black/60 text-white group-hover:flex"
+                                                 onClick={() => setReferences((value) => value.filter((ref) => ref.id !== item.id))}
+                                                 aria-label={t("imageWorkbench.removeReference")}
+                                             >
+                                                 <Trash2 className="size-3.5" />
+                                             </button>
+                                         </div>
                                     ))}
                                     {!references.length ? <div className="flex min-w-full items-center justify-center text-sm text-stone-500">{isReferenceDragActive ? t("imageWorkbench.dropReferences") : t("imageWorkbench.noReferences")}</div> : null}
                                 </div>
@@ -503,7 +370,7 @@ export default function ImagePage() {
                                     result.status === "success" && result.image ? (
                                         <ResultImageCard key={result.id} image={result.image} index={index} onEdit={addResultToReferences} onDownload={downloadImage} onSaveAsset={saveResultToAssets} />
                                     ) : result.status === "failed" ? (
-                                        <FailedImageCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={() => retryResult(index)} />
+                                        <FailedImageCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={() => void handleRetry(index)} />
                                     ) : (
                                         <PendingImageCard key={result.id} />
                                     ),
@@ -535,9 +402,15 @@ export default function ImagePage() {
                     selectedLogIds={selectedLogIds}
                     activeLogId={previewLog?.id}
                     onSelectedLogIdsChange={setSelectedLogIds}
-                    onCreateSession={createSession}
+                    onCreateSession={() => {
+                        createSession();
+                        setLogsOpen(false);
+                    }}
                     onDeleteSelected={() => setDeleteConfirmOpen(true)}
-                    onPreviewLog={(log) => void previewGenerationLog(log)}
+                    onPreviewLog={(log) => {
+                        void previewGenerationLog(log);
+                        setLogsOpen(false);
+                    }}
                 />
             </Drawer>
             <Drawer title={t("workbench.settings")} placement="bottom" size="82vh" open={settingsOpen} onClose={() => setSettingsOpen(false)}>
@@ -547,7 +420,7 @@ export default function ImagePage() {
             </Drawer>
             <PromptSelectDialog open={promptDialogOpen} onOpenChange={setPromptDialogOpen} onSelect={setPrompt} />
             <AssetPickerModal open={assetPickerOpen} defaultTab="my-assets" onInsert={(payload) => void insertPickedAsset(payload)} onClose={() => setAssetPickerOpen(false)} />
-            <Modal title={t("workbench.deleteLogs")} open={deleteConfirmOpen} onCancel={() => setDeleteConfirmOpen(false)} onOk={deleteSelectedLogs} okText={t("common.delete")} okButtonProps={{ danger: true }} cancelText={t("common.cancel")}>
+            <Modal title={t("workbench.deleteLogs")} open={deleteConfirmOpen} onCancel={() => setDeleteConfirmOpen(false)} onOk={handleDeleteSelected} okText={t("common.delete")} okButtonProps={{ danger: true }} cancelText={t("common.cancel")}>
                 {t("workbench.deleteLogsConfirm", { count: selectedLogIds.length })}
             </Modal>
         </div>
@@ -656,10 +529,6 @@ function FailedImageCard({ error, onRetry }: { error: string; onRetry: () => voi
     );
 }
 
-function updateResultAt(results: GenerationResult[], index: number, next: Partial<GenerationResult>) {
-    return results.map((item, itemIndex) => (itemIndex === index ? { ...item, ...next } : item));
-}
-
 function LogPanel({
     logs,
     selectedLogIds,
@@ -742,21 +611,32 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
                     </div>
                 </div>
                 <div className="grid justify-items-end gap-2">
-                    <div className="flex gap-1">
-                        <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color="blue">
-                            {t("workbench.successCount", { count: log.successCount ?? log.imageCount })}
-                        </Tag>
-                        {log.failCount ? (
-                            <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color="red">
-                                {t("workbench.failCount", { count: log.failCount })}
+                    {log.status === "pending" ? (
+                        <div className="flex gap-1">
+                            <Tag className="m-0 flex h-6 items-center gap-1 rounded-md px-1.5 text-xs leading-none" color="processing">
+                                <LoaderCircle className="size-3 animate-spin" />
+                                {t("workbench.generating")}
                             </Tag>
-                        ) : null}
-                    </div>
+                        </div>
+                    ) : (
+                        <div className="flex gap-1">
+                            <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color="blue">
+                                {t("workbench.successCount", { count: log.successCount ?? log.imageCount })}
+                            </Tag>
+                            {log.failCount ? (
+                                <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color="red">
+                                    {t("workbench.failCount", { count: log.failCount })}
+                                </Tag>
+                            ) : null}
+                        </div>
+                    )}
                     <div className="flex flex-wrap justify-end gap-1">
                         <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none">{t("workbench.itemCount", { count: log.imageCount })}</Tag>
-                        <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color="green">
-                            {formatDuration(log.durationMs)}
-                        </Tag>
+                        {log.durationMs > 0 ? (
+                            <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color="green">
+                                {formatDuration(log.durationMs)}
+                            </Tag>
+                        ) : null}
                     </div>
                     <div className="flex justify-end">
                         <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none">{log.time}</Tag>
@@ -765,74 +645,6 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
             </div>
         </button>
     );
-}
-
-async function readStoredLogs() {
-    if (typeof window === "undefined") return [];
-    try {
-        const values: GenerationLog[] = [];
-        await logStore.iterate<GenerationLog, void>((value) => {
-            values.push(value);
-        });
-        const logs = await Promise.all(values.map(normalizeLog));
-        return logs.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    } catch {
-        return [];
-    }
-}
-
-async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog> {
-    const references = await Promise.all(
-        (log.references || []).map(async (item) => ({
-            ...item,
-            dataUrl: await resolveImageUrl(item.storageKey, item.dataUrl),
-        })),
-    );
-    const images = await Promise.all(
-        (log.images || []).map(async (item) => ({
-            ...item,
-            dataUrl: await resolveImageUrl(item.storageKey, item.dataUrl),
-        })),
-    );
-    const config = normalizeLogConfig(log);
-    return {
-        id: log.id || nanoid(),
-        createdAt: log.createdAt || Date.now(),
-        title: log.title || log.model || i18n.t("workbench.untitled"),
-        prompt: log.prompt || log.title || "",
-        time: log.time || new Date().toLocaleString(i18n.resolvedLanguage, { hour12: false }),
-        model: log.model || config.imageModel || "",
-        config,
-        references,
-        durationMs: log.durationMs || 0,
-        successCount: log.successCount ?? log.imageCount ?? 0,
-        failCount: log.failCount || 0,
-        imageCount: log.imageCount || log.successCount || 0,
-        size: log.size || config.size || "",
-        quality: log.quality || config.quality || "",
-        status: log.status || "success",
-        images,
-        thumbnails: images.map((image) => image.dataUrl).filter(Boolean),
-    };
-}
-
-function serializeLog(log: GenerationLog): GenerationLog {
-    return {
-        ...log,
-        references: log.references.map((item) => ({ ...item, dataUrl: item.storageKey ? "" : item.dataUrl })),
-        images: log.images.map((image) => ({ ...image, dataUrl: image.storageKey ? "" : image.dataUrl })),
-        thumbnails: [],
-    };
-}
-
-function normalizeLogConfig(log: Partial<GenerationLog>): GenerationLogConfig {
-    return {
-        model: log.config?.model || log.model || "",
-        imageModel: log.config?.imageModel || log.model || "",
-        quality: log.config?.quality || log.quality || "",
-        size: log.config?.size || log.size || "",
-        count: log.config?.count || String(log.imageCount || log.successCount || 1),
-    };
 }
 
 function moveListItem<T>(items: T[], index: number, offset: number) {
@@ -851,53 +663,4 @@ function ReferenceOrderButtons({ index, total, onMove }: { index: number; total:
             <Button size="small" className="!h-6 !w-6 !min-w-6 !rounded-full !bg-white/85 !p-0 !shadow-sm" icon={<ArrowRight className="size-3" />} disabled={index >= total - 1} onClick={() => onMove(1)} />
         </div>
     );
-}
-
-function buildLog({
-    prompt,
-    model,
-    config,
-    references,
-    durationMs,
-    successCount,
-    failCount,
-    status,
-    images,
-}: {
-    prompt: string;
-    model: string;
-    config: GenerationLogConfig;
-    references: ReferenceImage[];
-    durationMs: number;
-    successCount: number;
-    failCount: number;
-    status: GenerationLog["status"];
-    images: GeneratedImage[];
-}): GenerationLog {
-    const logConfig = {
-        model: config.model,
-        imageModel: config.imageModel,
-        quality: config.quality,
-        size: config.size,
-        count: config.count,
-    };
-    return {
-        id: nanoid(),
-        createdAt: Date.now(),
-        title: prompt.slice(0, 12) || i18n.t("workbench.untitled"),
-        prompt,
-        time: new Date().toLocaleString(i18n.resolvedLanguage, { hour12: false }),
-        model,
-        config: logConfig,
-        references,
-        durationMs,
-        successCount,
-        failCount,
-        imageCount: Number(logConfig.count) || successCount,
-        size: logConfig.size,
-        quality: logConfig.quality,
-        status,
-        images,
-        thumbnails: images.map((image) => image.dataUrl).filter(Boolean),
-    };
 }
